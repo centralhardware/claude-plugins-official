@@ -429,6 +429,86 @@ async function sendText(
   }
 }
 
+// ── Markdown tables ──────────────────────────────────────────────────────────
+// Telegram renders nothing for a GitHub-style pipe table: the raw `| a | b |`
+// rows reach the chat as written and wrap into noise on a phone. A narrow table
+// is rewritten as an aligned monospace block; a wide one (the usual case once a
+// cell holds a URL) becomes one labelled record per row, which stays readable
+// at phone width. Empty cells are dropped from records.
+const TABLE_PRE_WIDTH = 44
+
+function splitRow(line: string): string[] {
+  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim())
+}
+
+function isTableRow(line: string): boolean {
+  const t = line.trim()
+  return t.startsWith('|') && t.endsWith('|') && t.length > 1
+}
+
+function isSeparatorRow(line: string): boolean {
+  if (!isTableRow(line)) return false
+  const cells = splitRow(line)
+  return cells.length > 0 && cells.every(c => /^:?-+:?$/.test(c))
+}
+
+function renderTable(
+  header: string[],
+  rows: string[][],
+  parseMode: ReturnType<typeof parseModeOf>,
+): string {
+  const cols = Math.max(header.length, ...rows.map(r => r.length))
+  const grid = [header, ...rows].map(r => Array.from({ length: cols }, (_, i) => r[i] ?? ''))
+  const widths = Array.from({ length: cols }, (_, i) => Math.max(...grid.map(r => r[i].length)))
+  const total = widths.reduce((a, b) => a + b, 0) + 2 * (cols - 1)
+  if (total <= TABLE_PRE_WIDTH) {
+    const row = (r: string[]) => r.map((c, i) => c.padEnd(widths[i])).join('  ').trimEnd()
+    const body = [
+      row(grid[0]),
+      widths.map(w => '─'.repeat(w)).join('  '),
+      ...grid.slice(1).map(row),
+    ].join('\n')
+    if (parseMode === 'HTML') return `<pre>${body}</pre>`
+    return parseMode ? '```\n' + body + '\n```' : body
+  }
+  const bold = (s: string) =>
+    parseMode === 'HTML' ? `<b>${s}</b>` : parseMode ? `*${s}*` : s
+  return grid
+    .slice(1)
+    .map(r => {
+      const out = [bold(r[0] || '—')]
+      for (let i = 1; i < cols; i++) {
+        if (!r[i]) continue
+        out.push(grid[0][i] ? `${grid[0][i]}: ${r[i]}` : r[i])
+      }
+      return out.join('\n')
+    })
+    .join('\n\n')
+}
+
+// Rewrite every pipe table in an outbound message; everything else is untouched.
+function normalizeTables(text: string, format: unknown): string {
+  if (!text || !text.includes('|')) return text
+  const parseMode = parseModeOf(format)
+  const lines = text.split('\n')
+  const out: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (isTableRow(lines[i]) && isSeparatorRow(lines[i + 1] ?? '')) {
+      const header = splitRow(lines[i])
+      const rows: string[][] = []
+      let j = i + 2
+      for (; j < lines.length && isTableRow(lines[j]); j++) rows.push(splitRow(lines[j]))
+      if (rows.length) {
+        out.push(renderTable(header, rows, parseMode))
+        i = j - 1
+        continue
+      }
+    }
+    out.push(lines[i])
+  }
+  return out.join('\n')
+}
+
 // ── Rich messages (Bot API 10.1) ─────────────────────────────────────────────
 // sendRichMessage takes a block document instead of a flat string: headings,
 // real lists, tables, and `details` blocks that collapse long passages behind a
@@ -486,8 +566,12 @@ function blocksToPlain(blocks: unknown, depth = 0): string {
     } else if (type === 'divider') {
       lines.push(`${pad}—`)
     } else if (type === 'table') {
-      for (const row of (b.cells as { text?: unknown }[][] | undefined) ?? []) {
-        lines.push(pad + row.map(c => richTextToPlain(c.text)).join(' | '))
+      const cells = ((b.cells as { text?: unknown }[][] | undefined) ?? [])
+        .map(row => row.map(c => richTextToPlain(c.text)))
+      if (cells.length) {
+        for (const l of renderTable(cells[0], cells.slice(1), undefined).split('\n')) {
+          lines.push(pad + l)
+        }
       }
     } else {
       lines.push(pad + richTextToPlain(b.text))
@@ -931,8 +1015,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const rich = parseRich(args.rich)
         // rich carries its own text; a plain reply still needs one.
-        const text = (args.text as string | undefined) ?? (rich ? '' : undefined as unknown as string)
-        if (text == null && !rich) throw new Error('reply needs text or rich')
+        const rawText = (args.text as string | undefined) ?? (rich ? '' : undefined as unknown as string)
+        const text = rawText == null ? rawText : normalizeTables(rawText, args.format)
+        if (rawText == null && !rich) throw new Error('reply needs text or rich')
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
         const files = (args.files as string[] | undefined) ?? []
         const parseMode = parseModeOf(args.format)
@@ -1095,6 +1180,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
         const editParseMode = parseModeOf(args.format)
+        const editText = normalizeTables(args.text as string, args.format)
         // In a guest chat the bot has no message handle — the one answer it
         // placed there is an inline message, edited by inline_message_id.
         const editGuestQuery = guestFor(args.chat_id as string)
@@ -1102,14 +1188,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           if (!editGuestQuery.answered) {
             throw new Error('nothing to edit yet — answer the guest query with reply first')
           }
-          await editGuest(editGuestQuery.answered, args.text as string, editParseMode)
+          await editGuest(editGuestQuery.answered, editText, editParseMode)
           return { content: [{ type: 'text', text: 'edited guest answer' }] }
         }
         const editMessage = (mode: ReturnType<typeof parseModeOf>) =>
           bot.api.editMessageText(
             args.chat_id as string,
             Number(args.message_id),
-            args.text as string,
+            editText,
             ...(mode ? [{ parse_mode: mode }] : []),
           )
         // Same plain-text fallback as reply(): losing a progress update to a

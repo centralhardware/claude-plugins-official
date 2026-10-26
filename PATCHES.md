@@ -16,6 +16,7 @@ plugin only. Everything that remains is upstream except the commits below.
 | `telegram: answer guest queries from allowlisted callers` | see below |
 | `telegram: move per-topic instructions into the channel meta` | a topic's standing rules ride in a `topic_instructions` attribute instead of being prepended to the message body, so the model still gets them while the transcript shows only what the sender typed |
 | `telegram: add /cancel to interrupt the running turn` | DM-only, allowlist-gated `/cancel` presses Escape in the session's tmux pane (`tmux send-keys -t $CLAUDE_TMUX_SESSION Escape`, default session `claude`) and stops the typing keep-alive. It lives in the server, not a UserPromptSubmit hook like `/clr`, because Claude Code queues prompts that arrive mid-turn — a relayed `/cancel` would only be read after the turn it was meant to stop had ended |
+| `telegram: render markdown tables readably` | outbound `reply`/`edit_message` text with a GitHub-style pipe table is rewritten before sending: a narrow table becomes an aligned monospace block (`<pre>` in html), a wide one becomes one labelled record per row (bold first cell, `header: value` lines, empty cells dropped), so tables stop arriving as raw `\| a \| b \|` noise. Rich `table` blocks use the same renderer in their plain-text fallback. |
 
 ## `telegram: fix poller lock, 409 bail-out and delivery; add topics + formats`
 
