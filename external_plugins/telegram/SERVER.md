@@ -43,8 +43,9 @@ when it is missing or older than the sources, then execs `java -jar`.
   marks a send-only topic.
 - **Formats** — `format: html | markdown | markdownv2`; a markup rejection is
   re-sent as plain text.
-- **Typing** — refreshed every 4 s until `reply`, a 10-minute cap, or the
-  `$CLAUDE_CONFIG_DIR/telegram-turn-done` sentinel written by local hooks.
+- **Typing** — refreshed every 4 s for the whole turn (mid-turn replies don't
+  stop it) until the Stop hook writes `$CLAUDE_CONFIG_DIR/telegram-turn-done`,
+  `/cancel`, or a 30-minute cap.
 - **Commands** — the menu lists only `$CLAUDE_CONFIG_DIR/telegram-commands.json`;
   `/start`, `/help`, `/status` still answer if typed. `/cancel` presses Escape
   in tmux session `$CLAUDE_TMUX_SESSION` (default `claude`).
@@ -57,3 +58,11 @@ when it is missing or older than the sources, then execs `java -jar`.
   chat the bot isn't in arrives with `guest="true"` and a synthetic
   `guest:<query id>` chat_id (1 h TTL). `reply` answers once via
   `answerGuestQuery`; further replies and `edit_message` edit that answer.
+- **Session Mini App** — watch-only view of the Claude Code tmux pane (with
+  scrollback), streamed over a WebSocket to an xterm.js page opened from the
+  bot's "Session" menu button. No input path. The socket's first message must be
+  Telegram's signed `initData` (valid hash, under a day old, user in
+  `allowFrom`). Config: `TELEGRAM_MINIAPP_PORT` (default 8790, 0 disables),
+  `TELEGRAM_MINIAPP_HOST`, `TELEGRAM_MINIAPP_URL` (public https URL — the menu
+  button is set only when present), `TELEGRAM_MINIAPP_HISTORY` (default 3000
+  lines). Runs only in the instance holding the poller lock.

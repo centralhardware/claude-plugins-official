@@ -117,8 +117,9 @@ private suspend fun notifyOwners(text: String) {
 
 private val ALLOWED_UPDATES = listOf("message", "callback_query", "guest_message")
 
-private suspend fun pollLoop(inbound: Inbound) {
+private suspend fun pollLoop(inbound: Inbound, miniApp: MiniApp) {
     if (!acquirePollerLock()) return
+    miniApp.start()
     var failures = 0
     var offset: Long? = null
     while (!shuttingDown) {
@@ -133,6 +134,7 @@ private suspend fun pollLoop(inbound: Inbound) {
                 log("guest mode is off for this bot — enable it in BotFather to be summonable from chats the bot is not in")
             }
             // Only the locally-defined commands are listed (start/help/status still work if typed).
+            miniApp.installMenuButton()
             try {
                 Tg.bot.setMyCommands(extraCommands().map { BotCommand(it.str("command")!!, it.str("description")!!) }, BotCommandScopeAllPrivateChats)
             } catch (_: Exception) {}
@@ -242,7 +244,8 @@ fun main() {
         }
     }
 
-    scope.launch { pollLoop(inbound) }
+    val miniApp = MiniApp(token)
+    scope.launch { pollLoop(inbound, miniApp) }
 
     runBlocking {
         mcp.run(scope)

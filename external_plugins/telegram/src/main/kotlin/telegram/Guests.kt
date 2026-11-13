@@ -92,8 +92,8 @@ object Guests {
 }
 
 // ── Typing keep-alive ────────────────────────────────────────────────────────
-// Telegram's chat action expires after ~5s; re-send every 4s until reply()
-// clears it, a hook marks the turn done, or a 10-minute cap elapses.
+// Telegram's chat action expires after ~5s; re-send every 4s until the Stop
+// hook marks the turn done (telegram-turn-done), /cancel, or a 30-minute cap.
 class Typing(private val scope: CoroutineScope) {
     private class Entry(val job: Job, @Volatile var until: Long, @Volatile var startedAt: Long)
     private val entries = ConcurrentHashMap<String, Entry>()
@@ -126,6 +126,6 @@ class Typing(private val scope: CoroutineScope) {
 
     companion object {
         const val REFRESH_MS = 4000L
-        const val MAX_MS = 10 * 60_000L
+        const val MAX_MS = 30 * 60_000L
     }
 }
