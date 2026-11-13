@@ -68,7 +68,11 @@ function render(msg) {
   if (shown && !atBottom()) { pending = true; statusEl.textContent = 'paused · scroll down for live'; return; }
   pending = false; shown = msg.data;
   statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
-  const data = msg.data.replace(/\s+$/, '');
+  // tmux pads lines to the pane width with spaces; at phone width that padding
+  // wraps into blank rows between the text. Drop trailing spaces (keep colour codes).
+  const data = msg.data.split('\n')
+    .map(l => l.replace(/[ \t]+((?:\x1b\[[0-9;]*m)*)$/, '$1'))
+    .join('\n').replace(/\s+$/, '');
   const g = geom();
   // Grow the terminal to the whole snapshot so the page, not xterm, does the scrolling.
   term.resize(g.cols, Math.max(g.rows, rowsFor(data, g.cols)));
@@ -76,7 +80,8 @@ function render(msg) {
   term.write('\x1b[H\x1b[2J\x1b[3J' + data, () => {
     const b = term.buffer.active;           // fix up any miscount (wide chars, etc.)
     const used = b.baseY + b.cursorY + 1;
-    if (used > term.rows) term.resize(g.cols, used);
+    // Shrink/grow to exactly the rows used, so there's no blank space to scroll past the end.
+    if (used !== term.rows) term.resize(g.cols, Math.max(1, used));
     requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
   });
 }
