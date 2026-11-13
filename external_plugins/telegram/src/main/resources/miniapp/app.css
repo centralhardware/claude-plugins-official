@@ -1,0 +1,15 @@
+html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font: 13px system-ui, sans-serif; }
+:root { --top: calc(var(--tg-safe-area-inset-top, 0px) + var(--tg-content-safe-area-inset-top, 0px)); }
+#bar { position: fixed; top: var(--top); left: 0; right: 0; height: 36px; display: flex; align-items: center;
+       gap: 8px; padding: 0 12px; background: #161b22; border-bottom: 1px solid #30363d; z-index: 2; }
+#dot { width: 8px; height: 8px; border-radius: 50%; background: #6e7681; }
+#dot.live { background: #3fb950; }
+#status { flex: 1; color: #8b949e; }
+/* The page scrolls natively (momentum, smooth); xterm is sized to the whole snapshot
+   so it never scrolls itself — its touch scrolling on phones is line-stepped and jerky. */
+#term { position: absolute; top: calc(var(--top) + 37px); left: 4px; right: 4px; bottom: 0;
+        overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+#term .xterm-viewport { overflow: hidden !important; }
+#term .xterm, #term .xterm-screen, #term canvas { touch-action: pan-y; pointer-events: none; }
+#bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+              font: 13px system-ui, sans-serif; min-width: 36px; height: 28px; }

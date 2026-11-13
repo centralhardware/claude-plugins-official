@@ -49,7 +49,9 @@ class MiniApp(token: String) {
             embeddedServer(CIO, port = port, host = host) {
                 install(WebSockets) { pingPeriod = 20.seconds }
                 routing {
-                    get("/") { call.respondText(PAGE, ContentType.Text.Html) }
+                    get("/") { asset(call, "index.html", ContentType.Text.Html) }
+                    get("/app.js") { asset(call, "app.js", ContentType.Text.JavaScript) }
+                    get("/app.css") { asset(call, "app.css", ContentType.Text.CSS) }
                     webSocket("/ws") { stream(this) }
                 }
             }.start(wait = false)
@@ -130,155 +132,18 @@ class MiniApp(token: String) {
         ).toString()
     }
 
+    /** Frontend files live in src/main/resources/miniapp/ and ship inside the jar. */
+    private suspend fun asset(call: ApplicationCall, name: String, type: ContentType) {
+        val bytes = assets.getOrPut(name) {
+            MiniApp::class.java.getResourceAsStream("/miniapp/$name")?.use { it.readBytes() } ?: ByteArray(0)
+        }
+        if (bytes.isEmpty()) call.respond(HttpStatusCode.NotFound) else call.respondBytes(bytes, type)
+    }
+    private val assets = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+
     private fun run(vararg cmd: String): String? = try {
         val p = ProcessBuilder(*cmd).redirectErrorStream(false).start()
         val out = p.inputStream.bufferedReader().readText()
         if (p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0) out else null
     } catch (_: Exception) { null }
 }
-
-private val PAGE = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Claude session</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-<style>
-  html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font: 13px system-ui, sans-serif; }
-  :root { --top: calc(var(--tg-safe-area-inset-top, 0px) + var(--tg-content-safe-area-inset-top, 0px)); }
-  #bar { position: fixed; top: var(--top); left: 0; right: 0; height: 36px; display: flex; align-items: center;
-         gap: 8px; padding: 0 12px; background: #161b22; border-bottom: 1px solid #30363d; z-index: 2; }
-  #dot { width: 8px; height: 8px; border-radius: 50%; background: #6e7681; }
-  #dot.live { background: #3fb950; }
-  #status { flex: 1; color: #8b949e; }
-  /* The page scrolls natively (momentum, smooth); xterm is sized to the whole snapshot
-     so it never scrolls itself — its touch scrolling on phones is line-stepped and jerky. */
-  #term { position: absolute; top: calc(var(--top) + 37px); left: 4px; right: 4px; bottom: 0;
-          overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
-  #term .xterm-viewport { overflow: hidden !important; }
-  #term .xterm, #term .xterm-screen, #term canvas { touch-action: pan-y; pointer-events: none; }
-  #bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
-                font: 13px system-ui, sans-serif; min-width: 36px; height: 28px; }
-</style>
-</head>
-<body>
-<div id="bar"><span id="dot"></span><span id="status">connecting…</span><button id="minus">A−</button><button id="plus">A+</button></div>
-<div id="term"></div>
-<script>
-const tg = window.Telegram && Telegram.WebApp;
-if (tg) {
-  tg.ready(); tg.expand();
-  // Open straight to full screen (Bot API 8.0+); older clients just stay expanded.
-  try { if (tg.requestFullscreen && tg.isVersionAtLeast('8.0')) tg.requestFullscreen(); } catch (e) {}
-  // Otherwise a vertical swipe in the terminal drags/closes the Mini App instead of scrolling.
-  try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
-  if (tg.onEvent) ['fullscreenChanged', 'safeAreaChanged', 'contentSafeAreaChanged']
-    .forEach(ev => tg.onEvent(ev, () => setTimeout(() => build(false), 50)));
-}
-const box = document.getElementById('term');
-const statusEl = document.getElementById('status');
-const dot = document.getElementById('dot');
-// A readable font, lines wrapped to the phone's width — the pane's own width
-// (often 200+ columns) would otherwise shrink the text to nothing.
-let fontSize = 12;
-try { fontSize = parseInt(localStorage.getItem('fontSize')) || 12; } catch (e) {}
-let term = null, lastMsg = null, shown = null, pending = false;
-
-let shownCols = 0;
-function geom() {
-  return { cols: Math.max(20, Math.floor(box.clientWidth / (fontSize * 0.6))),
-           rows: Math.max(5, Math.floor(box.clientHeight / (fontSize * 1.2))) };
-}
-function atBottom() { return box.scrollTop + box.clientHeight >= box.scrollHeight - 8; }
-
-function build(force) {
-  const g = geom();
-  // Telegram fires resize on every viewport twitch — rebuild only when the width really changes.
-  if (term && !force && g.cols === shownCols) return;
-  if (term) term.dispose();
-  shownCols = g.cols;
-  term = new Terminal({ cols: g.cols, rows: g.rows, fontSize, disableStdin: true, cursorBlink: false,
-    scrollback: 20000, convertEol: true, theme: { background: '#0d1117' } });
-  term.open(box);
-  shown = null;
-  if (lastMsg) { const m = lastMsg; lastMsg = null; render(m); }
-}
-
-function zoom(d) {
-  fontSize = Math.max(8, Math.min(20, fontSize + d));
-  try { localStorage.setItem('fontSize', String(fontSize)); } catch (e) {}
-  build(true);
-}
-document.getElementById('minus').onclick = () => zoom(-1);
-document.getElementById('plus').onclick = () => zoom(1);
-let resizeTimer = null;
-window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => build(false), 150); });
-// Back at the bottom → apply the snapshot that arrived while reading.
-box.addEventListener('scroll', () => { if (pending && atBottom()) { const m = lastMsg; lastMsg = null; render(m); } }, { passive: true });
-
-// Display rows the snapshot needs at this width (ANSI codes stripped).
-function rowsFor(text, cols) {
-  let n = 0;
-  for (const line of text.split('\n')) {
-    const len = line.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g, '').length;
-    n += Math.max(1, Math.ceil(len / cols));
-  }
-  return n;
-}
-
-function render(msg) {
-  lastMsg = msg;
-  if (!pending) statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
-  if (shown === msg.data) return; // unchanged snapshot — don't touch the screen
-  // Scrolled up to read: don't redraw under the finger. The newest snapshot is
-  // applied once you scroll back to the bottom.
-  if (shown && !atBottom()) { pending = true; statusEl.textContent = 'paused · scroll down for live'; return; }
-  pending = false; shown = msg.data;
-  statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
-  const data = msg.data.replace(/\s+$/, '');
-  const g = geom();
-  // Grow the terminal to the whole snapshot so the page, not xterm, does the scrolling.
-  term.resize(g.cols, Math.max(g.rows, rowsFor(data, g.cols)));
-  // Clear + redraw in ONE write so xterm paints a single frame (no flicker).
-  term.write('\x1b[H\x1b[2J\x1b[3J' + data, () => {
-    const b = term.buffer.active;           // fix up any miscount (wide chars, etc.)
-    const used = b.baseY + b.cursorY + 1;
-    if (used > term.rows) term.resize(g.cols, used);
-    requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
-  });
-}
-
-let ws = null, retry = null;
-function connect() {
-  if (!tg || !tg.initData) { statusEl.textContent = 'open this from the bot in Telegram'; return; }
-  clearTimeout(retry); retry = null;
-  if (ws && ws.readyState <= 1) return; // already open or opening
-  const sock = ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
-  sock.onopen = () => sock.send(tg.initData);
-  sock.onmessage = e => { dot.className = 'live'; render(JSON.parse(e.data)); };
-  sock.onclose = e => {
-    if (sock !== ws) return;
-    dot.className = '';
-    if (e.code === 4401) { statusEl.textContent = 'not authorized'; return; }
-    // Keep the last screen; while hidden don't retry at all — resume() reconnects on return.
-    if (document.hidden) return;
-    statusEl.textContent = 'reconnecting…';
-    retry = setTimeout(connect, 2000);
-  };
-}
-// Minimising suspends the webview and the OS drops the socket: reconnect at once
-// when it comes back instead of waiting out the retry timer, keeping the screen as is.
-function resume() { if (!document.hidden) connect(); }
-document.addEventListener('visibilitychange', resume);
-window.addEventListener('focus', resume);
-if (tg && tg.onEvent) tg.onEvent('activated', resume);
-build();
-connect();
-</script>
-</body>
-</html>
-""".trimIndent()
