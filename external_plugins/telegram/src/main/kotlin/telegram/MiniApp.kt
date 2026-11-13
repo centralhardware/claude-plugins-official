@@ -155,7 +155,12 @@ private val PAGE = """
   #dot { width: 8px; height: 8px; border-radius: 50%; background: #6e7681; }
   #dot.live { background: #3fb950; }
   #status { flex: 1; color: #8b949e; }
-  #term { position: absolute; top: calc(var(--top) + 37px); left: 4px; right: 4px; bottom: 0; }
+  /* The page scrolls natively (momentum, smooth); xterm is sized to the whole snapshot
+     so it never scrolls itself — its touch scrolling on phones is line-stepped and jerky. */
+  #term { position: absolute; top: calc(var(--top) + 37px); left: 4px; right: 4px; bottom: 0;
+          overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+  #term .xterm-viewport { overflow: hidden !important; }
+  #term .xterm, #term .xterm-screen, #term canvas { touch-action: pan-y; pointer-events: none; }
   #bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
                 font: 13px system-ui, sans-serif; min-width: 36px; height: 28px; }
 </style>
@@ -183,19 +188,22 @@ let fontSize = 12;
 try { fontSize = parseInt(localStorage.getItem('fontSize')) || 12; } catch (e) {}
 let term = null, lastMsg = null, shown = null, pending = false;
 
+let shownCols = 0;
+function geom() {
+  return { cols: Math.max(20, Math.floor(box.clientWidth / (fontSize * 0.6))),
+           rows: Math.max(5, Math.floor(box.clientHeight / (fontSize * 1.2))) };
+}
+function atBottom() { return box.scrollTop + box.clientHeight >= box.scrollHeight - 8; }
+
 function build(force) {
-  const cols = Math.max(20, Math.floor(box.clientWidth / (fontSize * 0.6)));
-  const rows = Math.max(5, Math.floor(box.clientHeight / (fontSize * 1.2)));
-  // Telegram fires resize on every viewport twitch — rebuild only when the grid really changes.
-  if (term && !force && term.cols === cols && term.rows === rows) return;
+  const g = geom();
+  // Telegram fires resize on every viewport twitch — rebuild only when the width really changes.
+  if (term && !force && g.cols === shownCols) return;
   if (term) term.dispose();
-  term = new Terminal({ cols, rows, fontSize, disableStdin: true, cursorBlink: false,
+  shownCols = g.cols;
+  term = new Terminal({ cols: g.cols, rows: g.rows, fontSize, disableStdin: true, cursorBlink: false,
     scrollback: 20000, convertEol: true, theme: { background: '#0d1117' } });
   term.open(box);
-  term.onScroll(() => {
-    const b = term.buffer.active;
-    if (pending && b.viewportY >= b.baseY) { const m = lastMsg; lastMsg = null; render(m); }
-  });
   shown = null;
   if (lastMsg) { const m = lastMsg; lastMsg = null; render(m); }
 }
@@ -209,20 +217,39 @@ document.getElementById('minus').onclick = () => zoom(-1);
 document.getElementById('plus').onclick = () => zoom(1);
 let resizeTimer = null;
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => build(false), 150); });
+// Back at the bottom → apply the snapshot that arrived while reading.
+box.addEventListener('scroll', () => { if (pending && atBottom()) { const m = lastMsg; lastMsg = null; render(m); } }, { passive: true });
+
+// Display rows the snapshot needs at this width (ANSI codes stripped).
+function rowsFor(text, cols) {
+  let n = 0;
+  for (const line of text.split('\n')) {
+    const len = line.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07/g, '').length;
+    n += Math.max(1, Math.ceil(len / cols));
+  }
+  return n;
+}
 
 function render(msg) {
   lastMsg = msg;
   if (!pending) statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
   if (shown === msg.data) return; // unchanged snapshot — don't touch the screen
-  const buf = term.buffer.active;
-  // Scrolled up to read: don't redraw under the finger — that made scrolling jump.
-  // The newest snapshot is applied once you scroll back to the bottom.
-  if (shown && buf.viewportY < buf.baseY) { pending = true; statusEl.textContent = 'paused · scroll down for live'; return; }
+  // Scrolled up to read: don't redraw under the finger. The newest snapshot is
+  // applied once you scroll back to the bottom.
+  if (shown && !atBottom()) { pending = true; statusEl.textContent = 'paused · scroll down for live'; return; }
   pending = false; shown = msg.data;
   statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
-  // Clear + redraw in ONE write so xterm paints a single frame; term.reset()
-  // followed by write() showed a blank frame on every update (the flicker).
-  term.write('\x1b[H\x1b[2J\x1b[3J' + msg.data.replace(/\s+$/, ''), () => term.scrollToBottom());
+  const data = msg.data.replace(/\s+$/, '');
+  const g = geom();
+  // Grow the terminal to the whole snapshot so the page, not xterm, does the scrolling.
+  term.resize(g.cols, Math.max(g.rows, rowsFor(data, g.cols)));
+  // Clear + redraw in ONE write so xterm paints a single frame (no flicker).
+  term.write('\x1b[H\x1b[2J\x1b[3J' + data, () => {
+    const b = term.buffer.active;           // fix up any miscount (wide chars, etc.)
+    const used = b.baseY + b.cursorY + 1;
+    if (used > term.rows) term.resize(g.cols, used);
+    requestAnimationFrame(() => { box.scrollTop = box.scrollHeight; });
+  });
 }
 
 let ws = null, retry = null;
