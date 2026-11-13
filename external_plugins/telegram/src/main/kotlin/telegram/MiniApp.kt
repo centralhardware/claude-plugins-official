@@ -211,18 +211,30 @@ function render(msg) {
   });
 }
 
+let ws = null, retry = null;
 function connect() {
   if (!tg || !tg.initData) { statusEl.textContent = 'open this from the bot in Telegram'; return; }
-  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
-  ws.onopen = () => ws.send(tg.initData);
-  ws.onmessage = e => { dot.className = 'live'; render(JSON.parse(e.data)); };
-  ws.onclose = e => {
+  clearTimeout(retry); retry = null;
+  if (ws && ws.readyState <= 1) return; // already open or opening
+  const sock = ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  sock.onopen = () => sock.send(tg.initData);
+  sock.onmessage = e => { dot.className = 'live'; render(JSON.parse(e.data)); };
+  sock.onclose = e => {
+    if (sock !== ws) return;
     dot.className = '';
     if (e.code === 4401) { statusEl.textContent = 'not authorized'; return; }
+    // Keep the last screen; while hidden don't retry at all — resume() reconnects on return.
+    if (document.hidden) return;
     statusEl.textContent = 'reconnecting…';
-    setTimeout(connect, 2000);
+    retry = setTimeout(connect, 2000);
   };
 }
+// Minimising suspends the webview and the OS drops the socket: reconnect at once
+// when it comes back instead of waiting out the retry timer, keeping the screen as is.
+function resume() { if (!document.hidden) connect(); }
+document.addEventListener('visibilitychange', resume);
+window.addEventListener('focus', resume);
+if (tg && tg.onEvent) tg.onEvent('activated', resume);
 build();
 connect();
 </script>
