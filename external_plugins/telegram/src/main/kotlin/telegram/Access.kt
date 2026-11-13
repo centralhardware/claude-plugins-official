@@ -11,7 +11,7 @@ import java.security.SecureRandom
 /** Paths and env, resolved once at boot. */
 object Config {
     private val home = System.getProperty("user.home")
-    val stateDir = File(System.getenv("TELEGRAM_STATE_DIR") ?: "$home/.claude/channels/telegram")
+    val stateDir = File(System.getenv("TELEGRAM_STATE_DIR") ?: System.getProperty("telegram.stateDir") ?: "$home/.claude/channels/telegram")
     val accessFile = File(stateDir, "access.json")
     val approvedDir = File(stateDir, "approved")
     val envFile = File(stateDir, ".env")

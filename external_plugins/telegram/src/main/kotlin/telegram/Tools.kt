@@ -175,7 +175,8 @@ class Tools(private val typing: Typing) {
         val threadId = args.anyStr("thread_id")?.toLongOrNull() ?: lastThread[chatId]
 
         AccessStore.assertAllowedChat(chatId)
-        typing.stop(chatId)
+        // Typing is deliberately left running: a reply is often a progress note
+        // mid-turn. The Stop hook's turn-done sentinel ends it when the turn does.
 
         for (f in files) {
             assertSendable(f)
