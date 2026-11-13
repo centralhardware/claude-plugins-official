@@ -6,6 +6,7 @@ import dev.inmo.tgbotapi.extensions.api.get.getFileAdditionalInfo
 import dev.inmo.tgbotapi.extensions.api.send.media.sendDocument
 import dev.inmo.tgbotapi.extensions.api.send.media.sendPhoto
 import dev.inmo.tgbotapi.extensions.api.send.sendMessage
+import dev.inmo.tgbotapi.extensions.api.send.sendRichMessage
 import dev.inmo.tgbotapi.extensions.api.send.setMessageReaction
 import dev.inmo.tgbotapi.requests.abstracts.InputFile
 import dev.inmo.tgbotapi.types.ReplyParameters
@@ -50,15 +51,11 @@ suspend fun sendText(chatId: String, text: String, threadId: Long?, replyTo: Lon
     }
 }
 
-suspend fun sendRich(chatId: String, blocks: JsonArray, threadId: Long?, replyTo: Long?): Long {
-    val res = Tg.raw("sendRichMessage", json(
-        "chat_id" to chatId.toLong(),
-        "message_thread_id" to threadId,
-        "reply_parameters" to replyTo?.let { json("message_id" to it) },
-        "rich_message" to json("blocks" to blocks),
-    ))
-    return res.obj()?.long("message_id") ?: throw IllegalStateException("sendRichMessage returned no message_id")
-}
+suspend fun sendRich(chatId: String, blocks: JsonArray, threadId: Long?, replyTo: Long?): Long =
+    Tg.bot.sendRichMessage(
+        chatIdOf(chatId), richMessageOf(blocks),
+        threadId = threadOf(threadId), replyParameters = replyParams(chatId, replyTo),
+    ).messageId.long
 
 suspend fun downloadToInbox(fileId: String, fallbackExt: String = "bin"): String {
     val info = Tg.bot.getFileAdditionalInfo(FileId(fileId))
@@ -166,7 +163,7 @@ class Tools(private val typing: Typing) {
             guest.answered?.let { inlineId ->
                 val edited = flat.ifEmpty { blocksToPlain(rich) }.take(MAX_CHUNK_LIMIT)
                 if (edited.isEmpty()) throw IllegalArgumentException("nothing to edit: pass text or rich")
-                Guests.edit(inlineId, edited, fmt, rich)
+                Guests.edit(inlineId, edited, if (rich != null && flat.isEmpty()) null else fmt)
                 return text("guest query already answered — edited that message instead (Telegram allows one message per guest query)")
             }
             guest.answered = Guests.answer(guest, flat, fmt, rich)

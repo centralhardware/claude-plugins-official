@@ -3,7 +3,6 @@ package telegram
 import dev.inmo.tgbotapi.bot.TelegramBot
 import dev.inmo.tgbotapi.bot.exceptions.BotException
 import dev.inmo.tgbotapi.bot.ktor.telegramBot
-import dev.inmo.tgbotapi.requests.abstracts.SimpleRequest
 import dev.inmo.tgbotapi.types.ChatId
 import dev.inmo.tgbotapi.types.MessageId
 import dev.inmo.tgbotapi.types.MessageThreadId
@@ -15,27 +14,11 @@ import dev.inmo.tgbotapi.types.message.ParseMode
 import dev.inmo.kslog.common.KSLog
 import dev.inmo.kslog.common.LogLevel
 import dev.inmo.tgbotapi.utils.DefaultKTgBotAPIKSLog
-import kotlinx.serialization.DeserializationStrategy
-import kotlinx.serialization.SerializationStrategy
-import kotlinx.serialization.encoding.Encoder
+import dev.inmo.tgbotapi.types.rich.InputRichBlock
+import dev.inmo.tgbotapi.types.rich.InputRichMessage
+import dev.inmo.tgbotapi.types.rich.InputRichMessageBlocks
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.*
-
-/**
- * Any Bot API method by name with a raw JSON body, executed through ktgbotapi's
- * executor. Used where the payload is passed through untouched — the probed
- * rich-block schema and guest answers — so the model's blocks reach Telegram
- * exactly as written instead of round-tripping through typed models.
- */
-class RawRequest(private val name: String, val params: JsonObject) : SimpleRequest<JsonElement> {
-    override fun method(): String = name
-    override val resultDeserializer: DeserializationStrategy<JsonElement> get() = JsonElement.serializer()
-    override val requestSerializer: SerializationStrategy<*> get() = Ser
-
-    private object Ser : SerializationStrategy<RawRequest> {
-        override val descriptor = JsonObject.serializer().descriptor
-        override fun serialize(encoder: Encoder, value: RawRequest) = JsonObject.serializer().serialize(encoder, value.params)
-    }
-}
 
 object Tg {
     lateinit var bot: TelegramBot
@@ -50,9 +33,17 @@ object Tg {
         }
         bot = telegramBot(token)
     }
-
-    suspend fun raw(method: String, params: JsonObject): JsonElement = bot.execute(RawRequest(method, params))
 }
+
+/**
+ * The tool takes rich blocks as JSON; ktgbotapi's own InputRichBlock serializer
+ * decodes them into its typed blocks. A payload it can't decode fails like a
+ * Telegram rejection would, and the caller falls back to plain text.
+ */
+private val richJson = Json { ignoreUnknownKeys = true }
+
+fun richMessageOf(blocks: JsonArray): InputRichMessage =
+    InputRichMessageBlocks(richJson.decodeFromJsonElement(ListSerializer(InputRichBlock.serializer()), blocks))
 
 fun chatIdOf(s: String): ChatId = ChatId(RawChatId(s.toLong()))
 fun msgIdOf(v: Long): MessageId = MessageId(v)

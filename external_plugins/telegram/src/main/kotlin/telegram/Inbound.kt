@@ -4,13 +4,34 @@ import dev.inmo.tgbotapi.extensions.api.answers.answerCallbackQuery
 import dev.inmo.tgbotapi.extensions.api.edit.text.editMessageText
 import dev.inmo.tgbotapi.extensions.api.send.sendMessage
 import dev.inmo.tgbotapi.extensions.api.send.setMessageReaction
-import dev.inmo.tgbotapi.types.CallbackQueryId
+import dev.inmo.tgbotapi.types.abstracts.WithOptionalQuoteInfo
 import dev.inmo.tgbotapi.types.buttons.InlineKeyboardButtons.CallbackDataInlineKeyboardButton
 import dev.inmo.tgbotapi.types.buttons.InlineKeyboardMarkup
+import dev.inmo.tgbotapi.types.chat.Bot
+import dev.inmo.tgbotapi.types.chat.GroupChat
+import dev.inmo.tgbotapi.types.chat.PrivateChat
+import dev.inmo.tgbotapi.types.chat.PublicChat
+import dev.inmo.tgbotapi.types.chat.User
+import dev.inmo.tgbotapi.types.message.MessageOrigin
+import dev.inmo.tgbotapi.types.message.abstracts.ContentMessage
+import dev.inmo.tgbotapi.types.message.abstracts.FromUserMessage
+import dev.inmo.tgbotapi.types.message.abstracts.Message
+import dev.inmo.tgbotapi.types.message.abstracts.PossiblyForwardedMessage
+import dev.inmo.tgbotapi.types.message.abstracts.PossiblyReplyMessage
+import dev.inmo.tgbotapi.types.message.abstracts.PossiblyTopicMessage
+import dev.inmo.tgbotapi.types.message.abstracts.RequestGuestContentMessage
+import dev.inmo.tgbotapi.types.message.content.*
+import dev.inmo.tgbotapi.types.message.textsources.MentionTextSource
+import dev.inmo.tgbotapi.types.message.textsources.TextMentionTextSource
+import dev.inmo.tgbotapi.types.queries.callback.DataCallbackQuery
+import dev.inmo.tgbotapi.types.queries.callback.MessageCallbackQuery
 import dev.inmo.tgbotapi.types.reactions.Reaction
+import dev.inmo.tgbotapi.types.update.CallbackQueryUpdate
+import dev.inmo.tgbotapi.types.update.GuestMessageUpdate
+import dev.inmo.tgbotapi.types.update.MessageUpdate
+import dev.inmo.tgbotapi.types.update.abstracts.Update
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
-import java.io.File
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
@@ -20,6 +41,11 @@ import java.util.concurrent.ConcurrentHashMap
 private val PERMISSION_REPLY_RE = Regex("""^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$""", RegexOption.IGNORE_CASE)
 private val PERM_CALLBACK_RE = Regex("""^perm:(allow|deny|more):([a-km-z]{5})$""")
 
+private val ISO_MS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
+
+/** ISO-8601 with milliseconds (`…T05:45:42.000Z`) — hooks parse this. */
+fun isoTs(epochMillis: Long): String = ISO_MS.format(Instant.ofEpochMilli(epochMillis))
+
 /**
  * How long to hold an inbound message for companions. Telegram delivers a
  * comment and the messages forwarded with it (and every item of an album) as
@@ -27,23 +53,28 @@ private val PERM_CALLBACK_RE = Regex("""^perm:(allow|deny|more):([a-km-z]{5})$""
  * its own turn, the forwarded content arriving cut off from the comment that
  * explains it. Each new part restarts the window.
  */
-private val ISO_MS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
-
-/** Same shape as JS toISOString() — hooks parse this. */
-fun isoTs(epochSeconds: Long?): String = ISO_MS.format(Instant.ofEpochSecond(epochSeconds ?: 0))
-
 const val BATCH_WINDOW_MS = 1000L
 
 data class Attachment(val kind: String, val fileId: String, val size: Long?, val mime: String?, val name: String?)
 
 /** One inbound Telegram message, reduced to what the notification needs. */
 private class Part(
-    val msg: JsonObject,
+    val msg: ContentMessage<*>,
     val text: String,
-    val photoFileIds: List<String>?, // sizes ascending; largest is last
+    val photoFileId: String?, // largest size
     val attachment: Attachment?,
     val forwardedFrom: String?,
 )
+
+private val Message.chatIdStr: String get() = chat.id.chatId.long.toString()
+private val Message.idLong: Long get() = messageId.long
+private val Message.epochMillis: Long get() = date.unixMillisLong
+private val User.idStr: String get() = id.chatId.long.toString()
+private val User.handle: String get() = username?.withoutAt ?: idStr
+private val Message.sender: User? get() = (this as? FromUserMessage)?.from
+
+/** Forum topic id — only for messages that belong to a topic. */
+private val Message.topicThreadId: Long? get() = (this as? PossiblyTopicMessage)?.threadId?.long
 
 class Inbound(
     private val scope: CoroutineScope,
@@ -60,15 +91,13 @@ class Inbound(
         data class Pair(val code: String, val isResend: Boolean) : Gate
     }
 
-    private fun gate(msg: JsonObject): Gate {
+    private fun gate(msg: ContentMessage<*>): Gate {
         val access = AccessStore.load()
         if (AccessStore.pruneExpired(access)) AccessStore.save(access)
         if (access.dmPolicy == "disabled") return Gate.Drop
-        val from = msg.o("from") ?: return Gate.Drop
-        val senderId = from.long("id").toString()
-        val chat = msg.o("chat") ?: return Gate.Drop
-        when (chat.str("type")) {
-            "private" -> {
+        val senderId = msg.sender?.idStr ?: return Gate.Drop
+        return when (msg.chat) {
+            is PrivateChat -> {
                 if (senderId in access.allowFrom) return Gate.Deliver(access)
                 if (access.dmPolicy == "allowlist") return Gate.Drop
                 for ((code, p) in access.pending) {
@@ -83,24 +112,24 @@ class Inbound(
                 if (access.pending.size >= 3) return Gate.Drop
                 val code = AccessStore.newCode()
                 val now = System.currentTimeMillis()
-                access.pending[code] = PendingEntry(senderId, chat.long("id").toString(), now, now + 60 * 60 * 1000)
+                access.pending[code] = PendingEntry(senderId, msg.chatIdStr, now, now + 60 * 60 * 1000)
                 AccessStore.save(access)
-                return Gate.Pair(code, false)
+                Gate.Pair(code, false)
             }
-            "group", "supergroup" -> {
-                val policy = access.groups[chat.long("id").toString()] ?: return Gate.Drop
+            is GroupChat -> {
+                val policy = access.groups[msg.chatIdStr] ?: return Gate.Drop
                 if (policy.allowFrom.isNotEmpty() && senderId !in policy.allowFrom) return Gate.Drop
                 if (policy.requireMention && !isMentioned(msg, access.mentionPatterns)) return Gate.Drop
-                return Gate.Deliver(access)
+                Gate.Deliver(access)
             }
-            else -> return Gate.Drop
+            else -> Gate.Drop
         }
     }
 
     /** Like gate() for bot commands: no pairing side effects. */
-    private fun dmCommandGate(msg: JsonObject): Pair<Access, String>? {
-        if (msg.o("chat")?.str("type") != "private") return null
-        val senderId = msg.o("from")?.long("id")?.toString() ?: return null
+    private fun dmCommandGate(msg: ContentMessage<*>): Pair<Access, String>? {
+        if (msg.chat !is PrivateChat) return null
+        val senderId = msg.sender?.idStr ?: return null
         val access = AccessStore.load()
         if (AccessStore.pruneExpired(access)) AccessStore.save(access)
         if (access.dmPolicy == "disabled") return null
@@ -108,26 +137,16 @@ class Inbound(
         return access to senderId
     }
 
-    private fun isMentioned(msg: JsonObject, extra: List<String>?): Boolean {
-        val entities = msg.arr("entities") ?: msg.arr("caption_entities") ?: JsonArray(emptyList())
-        val text = msg.str("text") ?: msg.str("caption") ?: ""
+    private fun isMentioned(msg: ContentMessage<*>, extra: List<String>?): Boolean {
+        val content = msg.content as? TextedContent
         val me = Tg.username
-        for (e in entities) {
-            val o = e as? JsonObject ?: continue
-            when (o.str("type")) {
-                "mention" -> {
-                    val off = o.long("offset")?.toInt() ?: continue
-                    val len = o.long("length")?.toInt() ?: continue
-                    if (off + len <= text.length && text.substring(off, off + len).equals("@$me", ignoreCase = true)) return true
-                }
-                "text_mention" -> {
-                    val u = o.o("user")
-                    if (u?.bool("is_bot") == true && u.str("username") == me) return true
-                }
-            }
+        for (src in content?.textSources.orEmpty()) {
+            if (src is MentionTextSource && src.source.equals("@$me", ignoreCase = true)) return true
+            if (src is TextMentionTextSource && src.user is Bot && src.user.username?.withoutAt == me) return true
         }
         // A reply to one of our messages counts as an implicit mention.
-        if (msg.o("reply_to_message")?.o("from")?.str("username") == me) return true
+        if ((msg as? PossiblyReplyMessage)?.replyTo?.sender?.username?.withoutAt == me) return true
+        val text = content?.text ?: ""
         for (pat in extra.orEmpty()) {
             try { if (Regex(pat, RegexOption.IGNORE_CASE).containsMatchIn(text)) return true } catch (_: Exception) {}
         }
@@ -136,58 +155,58 @@ class Inbound(
 
     // ── Update dispatch ──────────────────────────────────────────────────────
 
-    suspend fun onUpdate(update: JsonObject) {
-        update.o("message")?.let { return onMessage(it) }
-        update.o("callback_query")?.let { return onCallback(it) }
-        update.o("guest_message")?.let { return onGuest(it) }
+    suspend fun onUpdate(update: Update) {
+        when (update) {
+            is GuestMessageUpdate -> onGuest(update.data)
+            is MessageUpdate -> (update.data as? ContentMessage<*>)?.let { onMessage(it) }
+            is CallbackQueryUpdate -> (update.data as? DataCallbackQuery)?.let { onCallback(it) }
+            else -> {}
+        }
     }
 
-    private suspend fun onMessage(msg: JsonObject) {
-        val text = msg.str("text")
+    private suspend fun onMessage(msg: ContentMessage<*>) {
+        val text = (msg.content as? TextContent)?.text
         if (text != null && text.startsWith("/") && handleCommand(msg, text)) return
-
         val part = toPart(msg) ?: return
         handleInbound(msg, part)
     }
 
-    private fun toPart(msg: JsonObject): Part? {
-        val caption = msg.str("caption")
+    private fun toPart(msg: ContentMessage<*>): Part? {
         val fwd = forwardLabel(msg)
-        msg.str("text")?.let { return Part(msg, it, null, null, fwd) }
-        msg.arr("photo")?.let { sizes ->
-            val ids = sizes.mapNotNull { (it as? JsonObject)?.str("file_id") }
-            return Part(msg, caption ?: "(photo)", ids, null, fwd)
+        val caption = (msg.content as? TextedContent)?.text
+        return when (val c = msg.content) {
+            is TextContent -> Part(msg, c.text, null, null, fwd)
+            is PhotoContent -> Part(msg, caption ?: "(photo)", c.media.fileId.fileId, null, fwd)
+            is DocumentContent -> {
+                val name = safeName(c.media.fileName)
+                Part(msg, caption ?: "(document: ${name ?: "file"})", null,
+                    Attachment("document", c.media.fileId.fileId, c.media.fileSize?.bytes?.toLong(), c.media.mimeType?.raw, name), fwd)
+            }
+            is VoiceContent -> Part(msg, caption ?: "(voice message)", null,
+                Attachment("voice", c.media.fileId.fileId, c.media.fileSize?.bytes?.toLong(), c.media.mimeType?.raw, null), fwd)
+            is AudioContent -> {
+                val name = safeName(c.media.fileName)
+                Part(msg, caption ?: "(audio: ${safeName(c.media.title) ?: name ?: "audio"})", null,
+                    Attachment("audio", c.media.fileId.fileId, c.media.fileSize?.bytes?.toLong(), c.media.mimeType?.raw, name), fwd)
+            }
+            is VideoContent -> Part(msg, caption ?: "(video)", null,
+                Attachment("video", c.media.fileId.fileId, c.media.fileSize?.bytes?.toLong(), c.media.mimeType?.raw, safeName(c.media.fileName)), fwd)
+            is VideoNoteContent -> Part(msg, "(video note)", null,
+                Attachment("video_note", c.media.fileId.fileId, c.media.fileSize?.bytes?.toLong(), null, null), fwd)
+            is StickerContent -> Part(msg, "(sticker${c.media.emoji?.let { " $it" } ?: ""})", null,
+                Attachment("sticker", c.media.fileId.fileId, c.media.fileSize?.bytes?.toLong(), null, null), fwd)
+            else -> null // other kinds aren't relayed
         }
-        fun att(kind: String, o: JsonObject, name: String? = safeName(o.str("file_name"))) =
-            Attachment(kind, o.str("file_id") ?: "", o.long("file_size"), o.str("mime_type"), name)
-        msg.o("document")?.let { d ->
-            val a = att("document", d)
-            return Part(msg, caption ?: "(document: ${a.name ?: "file"})", null, a, fwd)
-        }
-        msg.o("voice")?.let { v -> return Part(msg, caption ?: "(voice message)", null, att("voice", v, null), fwd) }
-        msg.o("audio")?.let { au ->
-            val a = att("audio", au)
-            return Part(msg, caption ?: "(audio: ${safeName(au.str("title")) ?: a.name ?: "audio"})", null, a, fwd)
-        }
-        msg.o("video")?.let { v -> return Part(msg, caption ?: "(video)", null, att("video", v), fwd) }
-        msg.o("video_note")?.let { v -> return Part(msg, "(video note)", null, att("video_note", v, null), fwd) }
-        msg.o("sticker")?.let { s ->
-            val emoji = s.str("emoji")?.let { " $it" } ?: ""
-            return Part(msg, "(sticker$emoji)", null, att("sticker", s, null).copy(mime = null), fwd)
-        }
-        return null // service messages and unsupported kinds — same as the TS handlers
     }
 
     /** "forwarded from …" label from forward_origin; null for an original message. */
-    private fun forwardLabel(msg: JsonObject): String? {
-        val o = msg.o("forward_origin") ?: return null
-        val label = when (o.str("type")) {
-            "user" -> o.o("sender_user")?.let { u ->
-                u.str("username")?.let { "@$it" } ?: listOfNotNull(u.str("first_name"), u.str("last_name")).joinToString(" ")
-            }
-            "hidden_user" -> o.str("sender_user_name")
-            "chat" -> o.o("sender_chat")?.str("title")
-            "channel" -> o.o("chat")?.let { c -> c.str("title") ?: c.str("username")?.let { "@$it" } }
+    private fun forwardLabel(msg: Message): String? {
+        val origin = (msg as? PossiblyForwardedMessage)?.forwardOrigin ?: return null
+        val label = when (origin) {
+            is MessageOrigin.User -> origin.user.username?.let { "@${it.withoutAt}" }
+                ?: listOf(origin.user.firstName, origin.user.lastName).filter { it.isNotBlank() }.joinToString(" ")
+            is MessageOrigin.HiddenUser -> origin.name
+            is MessageOrigin.Public -> (origin.chat as? PublicChat)?.title
             else -> null
         }
         return safeName(label?.ifBlank { null } ?: "unknown")
@@ -195,14 +214,14 @@ class Inbound(
 
     // ── Commands (DM-only; silent elsewhere) ─────────────────────────────────
 
-    private suspend fun handleCommand(msg: JsonObject, text: String): Boolean {
+    private suspend fun handleCommand(msg: ContentMessage<*>, text: String): Boolean {
         val token = text.substringBefore(' ').substringBefore('\n').removePrefix("/")
         val cmd = token.substringBefore('@').lowercase()
         val target = token.substringAfter('@', "")
         if (target.isNotEmpty() && !target.equals(Tg.username, ignoreCase = true)) return false
         if (cmd !in setOf("start", "help", "status", "cancel")) return false
         val gated = dmCommandGate(msg) ?: return true
-        val chatId = msg.o("chat")!!.long("id").toString()
+        val chatId = msg.chatIdStr
         suspend fun say(s: String) = try { Tg.bot.sendMessage(chatIdOf(chatId), s) } catch (e: Exception) { log("command reply failed: ${e.describe()}") }
         when (cmd) {
             "start" -> say(
@@ -221,7 +240,7 @@ class Inbound(
             "status" -> {
                 val (access, senderId) = gated
                 if (senderId in access.allowFrom) {
-                    val name = msg.o("from")?.str("username")?.let { "@$it" } ?: senderId
+                    val name = msg.sender?.username?.let { "@${it.withoutAt}" } ?: senderId
                     say("Paired as $name.")
                 } else {
                     val code = access.pending.entries.firstOrNull { it.value.senderId == senderId }?.key
@@ -273,15 +292,12 @@ class Inbound(
         }
     }
 
-    private suspend fun onCallback(cq: JsonObject) {
-        val id = CallbackQueryId(cq.str("id") ?: return)
-        suspend fun answer(text: String? = null) = try { Tg.bot.answerCallbackQuery(id, text) } catch (_: Exception) {}
-        val m = PERM_CALLBACK_RE.matchEntire(cq.str("data") ?: "") ?: return answer()
-        if (cq.o("from")?.long("id")?.toString() !in AccessStore.load().allowFrom) return answer("Not authorized.")
+    private suspend fun onCallback(cq: DataCallbackQuery) {
+        suspend fun answer(text: String? = null) = try { Tg.bot.answerCallbackQuery(cq.id, text) } catch (_: Exception) {}
+        val m = PERM_CALLBACK_RE.matchEntire(cq.data) ?: return answer()
+        if (cq.from.idStr !in AccessStore.load().allowFrom) return answer("Not authorized.")
         val (behavior, requestId) = m.destructured
-        val message = cq.o("message")
-        val chatId = message?.o("chat")?.long("id")?.toString()
-        val messageId = message?.long("message_id")
+        val message = (cq as? MessageCallbackQuery)?.message
 
         if (behavior == "more") {
             val (toolName, description, preview) = pendingPermissions[requestId] ?: return answer("Details no longer available.")
@@ -289,8 +305,8 @@ class Inbound(
                 Json { prettyPrint = true }.encodeToString(JsonElement.serializer(), Json.parseToJsonElement(preview))
             } catch (_: Exception) { preview }
             val expanded = "🔐 Permission: $toolName\n\ntool_name: $toolName\ndescription: $description\ninput_preview:\n$pretty"
-            if (chatId != null && messageId != null) {
-                try { Tg.bot.editMessageText(chatIdOf(chatId), msgIdOf(messageId), expanded, replyMarkup = permKeyboard(requestId, false)) } catch (_: Exception) {}
+            if (message != null) {
+                try { Tg.bot.editMessageText(message.chat.id, message.messageId, expanded, replyMarkup = permKeyboard(requestId, false)) } catch (_: Exception) {}
             }
             return answer()
         }
@@ -302,15 +318,15 @@ class Inbound(
         val label = if (behavior == "allow") "✅ Allowed" else "❌ Denied"
         answer(label)
         // Replace the buttons with the outcome so it can't be answered twice.
-        val original = message?.str("text")
-        if (chatId != null && messageId != null && original != null) {
-            try { Tg.bot.editMessageText(chatIdOf(chatId), msgIdOf(messageId), "$original\n\n$label") } catch (_: Exception) {}
+        val original = (message?.content as? TextContent)?.text
+        if (message != null && original != null) {
+            try { Tg.bot.editMessageText(message.chat.id, message.messageId, "$original\n\n$label") } catch (_: Exception) {}
         }
     }
 
     // ── Inbound messages, batched ────────────────────────────────────────────
 
-    private class Batch(val chatId: String, val threadId: Long?, val access: Access) {
+    private class Batch(val chatId: String, val threadId: Long?) {
         val parts = mutableListOf<Part>()
         var flush: Job? = null
     }
@@ -318,18 +334,18 @@ class Inbound(
     private val batches = HashMap<String, Batch>()
     private val batchLock = Any()
 
-    private suspend fun handleInbound(msg: JsonObject, part: Part) {
+    private suspend fun handleInbound(msg: ContentMessage<*>, part: Part) {
         val access = when (val g = gate(msg)) {
             Gate.Drop -> return
             is Gate.Pair -> {
                 val lead = if (g.isResend) "Still pending" else "Pairing required"
-                try { Tg.bot.sendMessage(chatIdOf(msg.o("chat")!!.long("id").toString()), "$lead — run in Claude Code:\n\n/telegram:access pair ${g.code}") } catch (_: Exception) {}
+                try { Tg.bot.sendMessage(chatIdOf(msg.chatIdStr), "$lead — run in Claude Code:\n\n/telegram:access pair ${g.code}") } catch (_: Exception) {}
                 return
             }
             is Gate.Deliver -> g.access
         }
-        val chatId = msg.o("chat")!!.long("id").toString()
-        val msgId = msg.long("message_id")
+        val chatId = msg.chatIdStr
+        val msgId = msg.idLong
 
         // "yes abcde" for a pending permission → structured verdict, not chat.
         PERMISSION_REPLY_RE.matchEntire(part.text)?.let { m ->
@@ -337,27 +353,26 @@ class Inbound(
             try {
                 mcp().notify("notifications/claude/channel/permission", json("request_id" to m.groupValues[2].lowercase(), "behavior" to if (allow) "allow" else "deny"))
             } catch (e: Exception) { log("permission verdict not delivered: $e") }
-            if (msgId != null) scope.launch {
+            scope.launch {
                 try { Tg.bot.setMessageReaction(chatIdOf(chatId), msgIdOf(msgId), Reaction.Emoji(if (allow) "✅" else "❌")) } catch (_: Exception) {}
             }
             return
         }
 
-        val threadId = if (msg.bool("is_topic_message") == true) msg.long("message_thread_id") else null
+        val threadId = msg.topicThreadId
         if (threadId != null) lastThread[chatId] = threadId else lastThread.remove(chatId)
         val topic = topicConfig(chatId, threadId)
         if (topic?.ignore == true) return // send-only topic
 
         typing.start(chatId, threadId)
         val ack = access.ackReaction
-        if (!ack.isNullOrEmpty() && msgId != null) scope.launch {
+        if (!ack.isNullOrEmpty()) scope.launch {
             try { Tg.bot.setMessageReaction(chatIdOf(chatId), msgIdOf(msgId), Reaction.Emoji(ack)) } catch (_: Exception) {}
         }
 
-        val sender = msg.o("from")?.long("id")
-        val key = "$chatId:${threadId ?: ""}:$sender"
+        val key = "$chatId:${threadId ?: ""}:${msg.sender?.idStr}"
         synchronized(batchLock) {
-            val batch = batches.getOrPut(key) { Batch(chatId, threadId, access) }
+            val batch = batches.getOrPut(key) { Batch(chatId, threadId) }
             batch.parts += part
             batch.flush?.cancel()
             batch.flush = scope.launch {
@@ -371,8 +386,8 @@ class Inbound(
         }
     }
 
-    private suspend fun downloadPhoto(fileIds: List<String>): String? = try {
-        downloadToInbox(fileIds.last(), "jpg")
+    private suspend fun downloadPhoto(fileId: String): String? = try {
+        downloadToInbox(fileId, "jpg")
     } catch (e: Exception) {
         log("photo download failed: ${e.describe()}")
         null
@@ -389,17 +404,17 @@ class Inbound(
 
         val meta = LinkedHashMap<String, String>()
         val msg = primary.msg
-        val from = msg.o("from")!!
+        val from = msg.sender!!
         meta["chat_id"] = batch.chatId
-        msg.long("message_id")?.let { meta["message_id"] = it.toString() }
-        if (ordered.size > 1) meta["message_ids"] = ordered.mapNotNull { it.msg.long("message_id") }.joinToString(",")
+        meta["message_id"] = msg.idLong.toString()
+        if (ordered.size > 1) meta["message_ids"] = ordered.joinToString(",") { it.msg.idLong.toString() }
         batch.threadId?.let { meta["thread_id"] = it.toString() }
         topic?.name?.let { meta["topic"] = safeName(it)!! }
         // Operator-written, so the risk isn't injection but a newline breaking the tag.
         topic?.instructions?.let { meta["topic_instructions"] = it.replace(Regex("""[<>\[\]\r\n]+"""), " ").trim() }
-        meta["user"] = from.str("username") ?: from.long("id").toString()
-        meta["user_id"] = from.long("id").toString()
-        meta["ts"] = isoTs(msg.long("date"))
+        meta["user"] = from.handle
+        meta["user_id"] = from.idStr
+        meta["ts"] = isoTs(msg.epochMillis)
         if (primary.forwardedFrom != null) meta["forwarded_from"] = primary.forwardedFrom
         addReplyMeta(meta, msg)
 
@@ -407,20 +422,15 @@ class Inbound(
         var photoN = 0
         var attN = 0
         for (p in ordered) {
-            p.photoFileIds?.takeIf { it.isNotEmpty() }?.let { ids ->
-                downloadPhoto(ids)?.let { path ->
+            p.photoFileId?.let { id ->
+                downloadPhoto(id)?.let { path ->
                     photoN++
                     meta[if (photoN == 1) "image_path" else "image_path_$photoN"] = path
                 }
             }
             p.attachment?.let { a ->
                 attN++
-                val sfx = if (attN == 1) "" else "_$attN"
-                meta["attachment_kind$sfx"] = a.kind
-                meta["attachment_file_id$sfx"] = a.fileId
-                a.size?.let { meta["attachment_size$sfx"] = it.toString() }
-                a.mime?.let { meta["attachment_mime$sfx"] = it }
-                a.name?.let { meta["attachment_name$sfx"] = it }
+                putAttachment(meta, a, if (attN == 1) "" else "_$attN")
             }
         }
 
@@ -435,18 +445,27 @@ class Inbound(
                     chatIdOf(batch.chatId),
                     "⚠️ Not delivered — the Claude Code session is not reachable right now. Your message was not seen; send it again once the session is back.",
                     threadId = threadOf(batch.threadId),
-                    replyParameters = replyParams(batch.chatId, msg.long("message_id")),
+                    replyParameters = replyParams(batch.chatId, msg.idLong),
                 )
             } catch (_: Exception) {}
         }
     }
 
-    private fun addReplyMeta(meta: MutableMap<String, String>, msg: JsonObject) {
-        val repliedTo = msg.o("reply_to_message") ?: return
-        meta["reply_to_message_id"] = repliedTo.long("message_id").toString()
-        repliedTo.o("from")?.let { meta["reply_to_user"] = it.str("username") ?: it.long("id").toString() }
-        // A highlighted fragment arrives in message.quote — prefer it.
-        val text = msg.o("quote")?.str("text") ?: repliedTo.str("text") ?: repliedTo.str("caption")
+    private fun putAttachment(meta: MutableMap<String, String>, a: Attachment, sfx: String = "") {
+        meta["attachment_kind$sfx"] = a.kind
+        meta["attachment_file_id$sfx"] = a.fileId
+        a.size?.let { meta["attachment_size$sfx"] = it.toString() }
+        a.mime?.let { meta["attachment_mime$sfx"] = it }
+        a.name?.let { meta["attachment_name$sfx"] = it }
+    }
+
+    private fun addReplyMeta(meta: MutableMap<String, String>, msg: ContentMessage<*>) {
+        val repliedTo = (msg as? PossiblyReplyMessage)?.replyTo ?: return
+        meta["reply_to_message_id"] = repliedTo.idLong.toString()
+        repliedTo.sender?.let { meta["reply_to_user"] = it.handle }
+        // A highlighted fragment arrives as the quote on this message's content — prefer it.
+        val quote = (msg.content as? WithOptionalQuoteInfo)?.quote?.text
+        val text = quote ?: ((repliedTo as? ContentMessage<*>)?.content as? TextedContent)?.text
         safeName(text)?.take(500)?.takeIf { it.isNotEmpty() }?.let { meta["reply_to_text"] = it }
     }
 
@@ -454,42 +473,34 @@ class Inbound(
     // Gate: the summoning user must be in the DM allowlist; anyone else is dropped
     // in silence (a reply would spend the one answer in a public chat).
 
-    private suspend fun onGuest(msg: JsonObject) {
-        val queryId = msg.str("guest_query_id") ?: return
-        val from = msg.o("from")
+    private suspend fun onGuest(msg: RequestGuestContentMessage<*>) {
+        val queryId = msg.guestQueryId.string
         val access = AccessStore.load()
-        val fromId = from?.long("id")?.toString()
-        if (access.dmPolicy == "disabled" || fromId == null || fromId !in access.allowFrom) {
-            log("guest query from ${fromId ?: "unknown"} dropped — not in allowFrom")
+        val fromId = msg.from.idStr
+        if (access.dmPolicy == "disabled" || fromId !in access.allowFrom) {
+            log("guest query from $fromId dropped — not in allowFrom")
             return
         }
         val query = Guests.add(queryId)
-        val chat = msg.o("chat")
-        log("guest query from $fromId in chat ${chat?.long("id")}")
+        log("guest query from $fromId in chat ${msg.chatIdStr}")
 
         val part = toPart(msg)
-        val imagePath = part?.photoFileIds?.let { downloadPhoto(it) }
+        val imagePath = part?.photoFileId?.let { downloadPhoto(it) }
         val attachment = part?.attachment?.takeIf { it.kind in setOf("document", "voice", "audio", "video") }
-        val content = msg.str("text") ?: msg.str("caption") ?: if (imagePath != null) "(photo)" else "(${attachment?.kind ?: "message"})"
+        val content = (msg.content as? TextedContent)?.text ?: if (imagePath != null) "(photo)" else "(${attachment?.kind ?: "message"})"
 
         val meta = LinkedHashMap<String, String>()
         meta["chat_id"] = Guests.key(queryId)
         meta["guest"] = "true"
-        meta["guest_chat_id"] = chat?.long("id").toString()
-        chat?.str("title")?.let { meta["guest_chat_title"] = safeName(it)!! }
-        meta["message_id"] = msg.long("message_id").toString()
-        meta["user"] = from.str("username") ?: fromId
+        meta["guest_chat_id"] = msg.chatIdStr
+        (msg.chat as? PublicChat)?.title?.let { meta["guest_chat_title"] = safeName(it)!! }
+        meta["message_id"] = msg.idLong.toString()
+        meta["user"] = msg.from.handle
         meta["user_id"] = fromId
-        meta["ts"] = isoTs(msg.long("date"))
+        meta["ts"] = isoTs(msg.epochMillis)
         addReplyMeta(meta, msg)
         imagePath?.let { meta["image_path"] = it }
-        attachment?.let { a ->
-            meta["attachment_kind"] = a.kind
-            meta["attachment_file_id"] = a.fileId
-            a.size?.let { meta["attachment_size"] = it.toString() }
-            a.mime?.let { meta["attachment_mime"] = it }
-            a.name?.let { meta["attachment_name"] = it }
-        }
+        attachment?.let { putAttachment(meta, it) }
         try {
             mcp().notify("notifications/claude/channel", json("content" to content, "meta" to meta))
         } catch (e: Exception) {

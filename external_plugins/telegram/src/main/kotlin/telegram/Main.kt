@@ -1,7 +1,7 @@
 package telegram
 
 import dev.inmo.tgbotapi.extensions.api.bot.getMe
-import dev.inmo.tgbotapi.extensions.api.getRawUpdates
+import dev.inmo.tgbotapi.extensions.api.getUpdates
 import dev.inmo.tgbotapi.types.UpdateId
 import dev.inmo.tgbotapi.extensions.api.bot.setMyCommands
 import dev.inmo.tgbotapi.extensions.api.send.sendMessage
@@ -38,8 +38,8 @@ private const val LOCK_STALE_MS = 90_000L
 private const val POLL_STABLE_MS = 60_000L
 private const val POLL_TIMEOUT_S = 30
 
-/** Marks our own process in /proc cmdline, and recognises the old TS poller during cutover. */
-private val POLLER_MARKERS = listOf("telegram-channel.jar", "server.ts")
+/** Identifies a poller process by its cmdline. */
+private const val POLLER_MARKER = "telegram-channel.jar"
 
 @Volatile private var shuttingDown = false
 @Volatile private var ownsPollerLock = false
@@ -63,7 +63,7 @@ fun shutdown(code: Int = 0) {
 private fun isPollerProcess(pid: Long): Boolean = try {
     val cmd = File("/proc/$pid/cmdline").takeIf { it.exists() }?.readText()?.replace('\u0000', ' ')
         ?: ProcessHandle.of(pid).flatMap { it.info().commandLine() }.orElse("")
-    POLLER_MARKERS.any { it in cmd }
+    POLLER_MARKER in cmd
 } catch (_: Exception) { false }
 
 private data class Holder(val pid: Long, val fresh: Boolean)
@@ -138,13 +138,11 @@ private suspend fun pollLoop(inbound: Inbound) {
             } catch (_: Exception) {}
 
             while (!shuttingDown) {
-                // GetUpdatesRaw (not a RawRequest) so the executor applies its long-poll timeout.
-                val updates = Tg.bot.getRawUpdates(offset?.let { UpdateId(it) }, timeout = POLL_TIMEOUT_S, allowed_updates = ALLOWED_UPDATES)
+                val updates = Tg.bot.getUpdates(offset?.let { UpdateId(it) }, timeout = POLL_TIMEOUT_S, allowed_updates = ALLOWED_UPDATES)
                 for (u in updates) {
-                    val o = u as? JsonObject ?: continue
-                    o.long("update_id")?.let { offset = it + 1 }
+                    offset = u.updateId.long + 1
                     // A throw in one handler must never stop polling.
-                    try { inbound.onUpdate(o) } catch (e: Exception) { log("handler error (polling continues): ${e.describe()}") }
+                    try { inbound.onUpdate(u) } catch (e: Exception) { log("handler error (polling continues): ${e.describe()}") }
                 }
                 if (System.currentTimeMillis() - startedAt > POLL_STABLE_MS) failures = 0
             }

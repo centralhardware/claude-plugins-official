@@ -1,6 +1,15 @@
 package telegram
 
+import dev.inmo.tgbotapi.extensions.api.answers.answerGuestQuery
+import dev.inmo.tgbotapi.extensions.api.edit.text.editMessageText
 import dev.inmo.tgbotapi.extensions.api.send.sendActionTyping
+import dev.inmo.tgbotapi.types.GuestQueryId
+import dev.inmo.tgbotapi.types.InlineMessageId
+import dev.inmo.tgbotapi.types.InlineQueryId
+import dev.inmo.tgbotapi.types.InlineQueries.InlineQueryResult.InlineQueryResultArticle
+import dev.inmo.tgbotapi.types.InlineQueries.InputMessageContent.InputMessageContent
+import dev.inmo.tgbotapi.types.InlineQueries.InputMessageContent.InputRichMessageContent
+import dev.inmo.tgbotapi.types.InlineQueries.InputMessageContent.InputTextMessageContent
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
 import java.security.SecureRandom
@@ -41,53 +50,43 @@ object Guests {
         return Query(queryId, System.currentTimeMillis() + TTL_MS).also { queries[key(queryId)] = it }
     }
 
-    private fun article(content: JsonObject) = json(
-        "type" to "article",
-        "id" to ByteArray(8).also { random.nextBytes(it) }.joinToString("") { "%02x".format(it) },
-        "title" to "Answer", // never rendered — input_message_content is what lands
-        "input_message_content" to content,
+    private fun article(content: InputMessageContent) = InlineQueryResultArticle(
+        InlineQueryId(ByteArray(8).also { random.nextBytes(it) }.joinToString("") { "%02x".format(it) }),
+        "Answer", // never rendered — input_message_content is what lands
+        content,
     )
 
-    private suspend fun send(q: Query, result: JsonObject): String {
-        val sent = Tg.raw("answerGuestQuery", json("guest_query_id" to q.queryId, "result" to result))
-        return sent.obj()?.str("inline_message_id") ?: throw IllegalStateException("answerGuestQuery returned no inline_message_id")
-    }
+    private suspend fun send(q: Query, content: InputMessageContent): String =
+        Tg.bot.answerGuestQuery(GuestQueryId(q.queryId), article(content)).inlineMessageId.string
 
     suspend fun answer(q: Query, text: String, fmt: Fmt?, rich: JsonArray?): String {
         if (rich != null) {
             return try {
-                send(q, article(json("rich_message" to json("blocks" to rich))))
+                send(q, InputRichMessageContent(richMessageOf(rich)))
             } catch (e: Exception) {
                 log("rich guest answer rejected (${e.describe()}) — resending as plain text")
-                send(q, article(json("message_text" to text.ifEmpty { blocksToPlain(rich) })))
+                send(q, InputTextMessageContent(text.ifEmpty { blocksToPlain(rich) }))
             }
         }
         return try {
-            send(q, article(json("message_text" to text, "parse_mode" to fmt?.toParseMode()?.parseModeName)))
+            send(q, InputTextMessageContent(text, fmt.toParseMode()))
         } catch (e: Exception) {
             if (fmt == null || !e.isParseErr()) throw e
             log("$fmt rejected on guest answer (${e.describe()}) — retrying as plain text")
-            send(q, article(json("message_text" to text)))
+            send(q, InputTextMessageContent(text))
         }
     }
 
-    suspend fun edit(inlineId: String, text: String, fmt: Fmt?, rich: JsonArray? = null) {
-        suspend fun plain(f: Fmt?) {
-            Tg.raw("editMessageText", json("inline_message_id" to inlineId, "text" to text, "parse_mode" to f?.toParseMode()?.parseModeName))
-        }
-        if (rich != null) {
-            try {
-                Tg.raw("editMessageText", json("inline_message_id" to inlineId, "rich_message" to json("blocks" to rich)))
-            } catch (e: Exception) {
-                log("rich guest edit rejected (${e.describe()}) — retrying as plain text")
-                plain(null)
-            }
-            return
-        }
-        try { plain(fmt) } catch (e: Exception) {
+    /**
+     * ktgbotapi has no inline rich edit, so a revised rich answer is re-sent as
+     * its plain-text flattening (the caller passes that as [text]).
+     */
+    suspend fun edit(inlineId: String, text: String, fmt: Fmt?) {
+        suspend fun go(f: Fmt?) = Tg.bot.editMessageText(InlineMessageId(inlineId), text, parseMode = f.toParseMode())
+        try { go(fmt) } catch (e: Exception) {
             if (fmt == null || !e.isParseErr()) throw e
             log("$fmt rejected on guest edit (${e.describe()}) — retrying as plain text")
-            plain(null)
+            go(null)
         }
     }
 }

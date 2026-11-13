@@ -8,7 +8,7 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.SecureRandom
 
-/** Paths and env, resolved once at boot — mirrors the top of server.ts. */
+/** Paths and env, resolved once at boot. */
 object Config {
     private val home = System.getProperty("user.home")
     val stateDir = File(System.getenv("TELEGRAM_STATE_DIR") ?: "$home/.claude/channels/telegram")
