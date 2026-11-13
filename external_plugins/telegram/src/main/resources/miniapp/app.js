@@ -59,6 +59,18 @@ function rowsFor(text, cols) {
   return n;
 }
 
+// Full-width rules (the ─── around Claude's input box) are as wide as the desktop
+// pane; wrapped at phone width they become a stack of lines. Clip a line made of
+// one repeated drawing char to the phone's width.
+const ESC = /\x1b\[[0-9;?]*[A-Za-z]/g;
+function clipRule(line) {
+  const plain = line.replace(ESC, '');
+  const cols = term ? term.cols : 80;
+  if (plain.length <= cols || !/^(.)\1+$/u.test(plain) || /[\w\s]/.test(plain[0])) return line;
+  const lead = (line.match(/^(?:\x1b\[[0-9;?]*[A-Za-z])*/) || [''])[0];
+  return lead + plain[0].repeat(cols) + '\x1b[0m';
+}
+
 function render(msg) {
   lastMsg = msg;
   if (!pending) statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
@@ -72,6 +84,7 @@ function render(msg) {
   // wraps into blank rows between the text. Drop trailing spaces (keep colour codes).
   const data = msg.data.split('\n')
     .map(l => l.replace(/[ \t]+((?:\x1b\[[0-9;]*m)*)$/, '$1'))
+    .map(clipRule)
     .join('\n').replace(/\s+$/, '');
   const g = geom();
   // Grow the terminal to the whole snapshot so the page, not xterm, does the scrolling.
