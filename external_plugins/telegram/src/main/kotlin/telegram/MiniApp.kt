@@ -149,12 +149,13 @@ private val PAGE = """
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <style>
   html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font: 13px system-ui, sans-serif; }
-  #bar { position: fixed; top: 0; left: 0; right: 0; height: 36px; display: flex; align-items: center;
+  :root { --top: calc(var(--tg-safe-area-inset-top, 0px) + var(--tg-content-safe-area-inset-top, 0px)); }
+  #bar { position: fixed; top: var(--top); left: 0; right: 0; height: 36px; display: flex; align-items: center;
          gap: 8px; padding: 0 12px; background: #161b22; border-bottom: 1px solid #30363d; z-index: 2; }
   #dot { width: 8px; height: 8px; border-radius: 50%; background: #6e7681; }
   #dot.live { background: #3fb950; }
   #status { flex: 1; color: #8b949e; }
-  #term { position: absolute; top: 37px; left: 4px; right: 4px; bottom: 0; }
+  #term { position: absolute; top: calc(var(--top) + 37px); left: 4px; right: 4px; bottom: 0; }
   #bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
                 font: 13px system-ui, sans-serif; min-width: 36px; height: 28px; }
 </style>
@@ -164,7 +165,15 @@ private val PAGE = """
 <div id="term"></div>
 <script>
 const tg = window.Telegram && Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
+if (tg) {
+  tg.ready(); tg.expand();
+  // Open straight to full screen (Bot API 8.0+); older clients just stay expanded.
+  try { if (tg.requestFullscreen && tg.isVersionAtLeast('8.0')) tg.requestFullscreen(); } catch (e) {}
+  // Otherwise a vertical swipe in the terminal drags/closes the Mini App instead of scrolling.
+  try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
+  if (tg.onEvent) ['fullscreenChanged', 'safeAreaChanged', 'contentSafeAreaChanged']
+    .forEach(ev => tg.onEvent(ev, () => setTimeout(() => build(false), 50)));
+}
 const box = document.getElementById('term');
 const statusEl = document.getElementById('status');
 const dot = document.getElementById('dot');
@@ -172,7 +181,7 @@ const dot = document.getElementById('dot');
 // (often 200+ columns) would otherwise shrink the text to nothing.
 let fontSize = 12;
 try { fontSize = parseInt(localStorage.getItem('fontSize')) || 12; } catch (e) {}
-let term = null, lastMsg = null;
+let term = null, lastMsg = null, shown = null, pending = false;
 
 function build(force) {
   const cols = Math.max(20, Math.floor(box.clientWidth / (fontSize * 0.6)));
@@ -183,7 +192,12 @@ function build(force) {
   term = new Terminal({ cols, rows, fontSize, disableStdin: true, cursorBlink: false,
     scrollback: 20000, convertEol: true, theme: { background: '#0d1117' } });
   term.open(box);
-  if (lastMsg) render(lastMsg);
+  term.onScroll(() => {
+    const b = term.buffer.active;
+    if (pending && b.viewportY >= b.baseY) { const m = lastMsg; lastMsg = null; render(m); }
+  });
+  shown = null;
+  if (lastMsg) { const m = lastMsg; lastMsg = null; render(m); }
 }
 
 function zoom(d) {
@@ -197,18 +211,18 @@ let resizeTimer = null;
 window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => build(false), 150); });
 
 function render(msg) {
-  const same = lastMsg && lastMsg.data === msg.data;
   lastMsg = msg;
-  statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
-  if (same) return; // unchanged snapshot — don't touch the screen
+  if (!pending) statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
+  if (shown === msg.data) return; // unchanged snapshot — don't touch the screen
   const buf = term.buffer.active;
-  const follow = buf.viewportY >= buf.baseY; // at the bottom → keep following
-  const keep = buf.viewportY;
+  // Scrolled up to read: don't redraw under the finger — that made scrolling jump.
+  // The newest snapshot is applied once you scroll back to the bottom.
+  if (shown && buf.viewportY < buf.baseY) { pending = true; statusEl.textContent = 'paused · scroll down for live'; return; }
+  pending = false; shown = msg.data;
+  statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
   // Clear + redraw in ONE write so xterm paints a single frame; term.reset()
   // followed by write() showed a blank frame on every update (the flicker).
-  term.write('\x1b[H\x1b[2J\x1b[3J' + msg.data.replace(/\s+$/, ''), () => {
-    if (follow) term.scrollToBottom(); else term.scrollToLine(keep);
-  });
+  term.write('\x1b[H\x1b[2J\x1b[3J' + msg.data.replace(/\s+$/, ''), () => term.scrollToBottom());
 }
 
 let ws = null, retry = null;
