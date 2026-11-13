@@ -17,19 +17,6 @@ class FormatTest {
         assertEquals(listOf("a".repeat(30), "b".repeat(30)), chunk(text, 40, "newline"))
     }
 
-    @Test fun narrowTableBecomesPre() {
-        val out = normalizeTables("x\n| a | b |\n|---|---|\n| 1 | 2 |\ny", "html")
-        assertEquals("x\n<pre>a  b\n─  ─\n1  2</pre>\ny", out)
-    }
-
-    @Test fun wideTableBecomesRecords() {
-        val url = "https://example.com/" + "x".repeat(60)
-        val out = normalizeTables("| name | link |\n|---|---|\n| foo | $url |", "html")
-        assertEquals("<b>foo</b>\nlink: $url", out)
-    }
-
-    @Test fun nonTablePipesUntouched() = assertEquals("a | b", normalizeTables("a | b", "html"))
-
     @Test fun richFlattensToPlain() {
         val blocks = Json.parseToJsonElement(
             """[{"type":"heading","size":1,"text":"Title"},

@@ -51,73 +51,6 @@ fun chunk(text: String, limit: Int, mode: String): List<String> {
     return out
 }
 
-// ── Markdown tables ──────────────────────────────────────────────────────────
-// A narrow pipe table becomes an aligned monospace block; a wide one becomes one
-// labelled record per row, readable at phone width. Empty cells are dropped.
-const val TABLE_PRE_WIDTH = 44
-
-private fun splitRow(line: String): List<String> =
-    line.trim().removePrefix("|").removeSuffix("|").split('|').map { it.trim() }
-
-private fun isTableRow(line: String): Boolean {
-    val t = line.trim()
-    return t.startsWith("|") && t.endsWith("|") && t.length > 1
-}
-
-private val SEP_CELL = Regex("^:?-+:?$")
-private fun isSeparatorRow(line: String): Boolean =
-    isTableRow(line) && splitRow(line).let { cells -> cells.isNotEmpty() && cells.all { SEP_CELL.matches(it) } }
-
-fun renderTable(header: List<String>, rows: List<List<String>>, fmt: Fmt?): String {
-    val cols = (listOf(header.size) + rows.map { it.size }).max()
-    val grid = (listOf(header) + rows).map { r -> List(cols) { i -> r.getOrElse(i) { "" } } }
-    val widths = List(cols) { i -> grid.maxOf { it[i].length } }
-    val total = widths.sum() + 2 * (cols - 1)
-    if (total <= TABLE_PRE_WIDTH) {
-        fun row(r: List<String>) = r.mapIndexed { i, c -> c.padEnd(widths[i]) }.joinToString("  ").trimEnd()
-        val body = (listOf(row(grid[0]), widths.joinToString("  ") { "─".repeat(it) }) + grid.drop(1).map(::row)).joinToString("\n")
-        return when (fmt) {
-            Fmt.HTML -> "<pre>$body</pre>"
-            null -> body
-            else -> "```\n$body\n```"
-        }
-    }
-    fun bold(s: String) = when (fmt) { Fmt.HTML -> "<b>$s</b>"; null -> s; else -> "*$s*" }
-    return grid.drop(1).joinToString("\n\n") { r ->
-        val out = mutableListOf(bold(r[0].ifEmpty { "—" }))
-        for (i in 1 until cols) {
-            if (r[i].isEmpty()) continue
-            out += if (grid[0][i].isNotEmpty()) "${grid[0][i]}: ${r[i]}" else r[i]
-        }
-        out.joinToString("\n")
-    }
-}
-
-/** Rewrite every pipe table in an outbound message; everything else untouched. */
-fun normalizeTables(text: String, format: String?): String {
-    if (text.isEmpty() || '|' !in text) return text
-    val fmt = fmtOf(format)
-    val lines = text.split('\n')
-    val out = mutableListOf<String>()
-    var i = 0
-    while (i < lines.size) {
-        if (isTableRow(lines[i]) && isSeparatorRow(lines.getOrElse(i + 1) { "" })) {
-            val header = splitRow(lines[i])
-            val rows = mutableListOf<List<String>>()
-            var j = i + 2
-            while (j < lines.size && isTableRow(lines[j])) rows += splitRow(lines[j++])
-            if (rows.isNotEmpty()) {
-                out += renderTable(header, rows, fmt)
-                i = j
-                continue
-            }
-        }
-        out += lines[i]
-        i++
-    }
-    return out.joinToString("\n")
-}
-
 // ── Rich messages (Bot API 10.1) ─────────────────────────────────────────────
 // Blocks are passed through untouched (the accepted schema was probed live and
 // is narrower than the docs); on rejection they're flattened to plain text.
@@ -167,7 +100,7 @@ fun blocksToPlain(blocks: JsonElement?, depth: Int = 0): String {
                 val cells = o.arr("cells").orEmpty().map { row ->
                     (row as? JsonArray).orEmpty().map { c -> richTextToPlain((c as? JsonObject)?.get("text")) }
                 }
-                if (cells.isNotEmpty()) renderTable(cells[0], cells.drop(1), null).split('\n').forEach { lines += pad + it }
+                cells.forEach { row -> lines += pad + row.joinToString(" | ") }
             }
             else -> lines += pad + richTextToPlain(o["text"])
         }

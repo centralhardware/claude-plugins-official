@@ -155,7 +155,7 @@ class Tools(private val typing: Typing) {
         val rich = parseRich(args["rich"])
         val rawText = args.anyStr("text")
         if (rawText == null && rich == null) throw IllegalArgumentException("reply needs text or rich")
-        val text = normalizeTables(rawText ?: "", format)
+        val text = rawText ?: ""
         val replyTo = args.anyStr("reply_to")?.toLongOrNull()
         val files = args.arr("files")?.mapNotNull { (it as? JsonPrimitive)?.content }.orEmpty()
         val fmt = fmtOf(format)
@@ -244,7 +244,7 @@ class Tools(private val typing: Typing) {
         AccessStore.assertAllowedChat(chatId)
         val format = args.str("format")
         val fmt = fmtOf(format)
-        val body = normalizeTables(args.anyStr("text") ?: "", format)
+        val body = args.anyStr("text") ?: ""
         Guests.get(chatId)?.let { q ->
             val inlineId = q.answered ?: throw IllegalStateException("nothing to edit yet — answer the guest query with reply first")
             Guests.edit(inlineId, body, fmt)
