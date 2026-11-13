@@ -174,10 +174,12 @@ let fontSize = 12;
 try { fontSize = parseInt(localStorage.getItem('fontSize')) || 12; } catch (e) {}
 let term = null, lastMsg = null;
 
-function build() {
-  if (term) term.dispose();
+function build(force) {
   const cols = Math.max(20, Math.floor(box.clientWidth / (fontSize * 0.6)));
   const rows = Math.max(5, Math.floor(box.clientHeight / (fontSize * 1.2)));
+  // Telegram fires resize on every viewport twitch — rebuild only when the grid really changes.
+  if (term && !force && term.cols === cols && term.rows === rows) return;
+  if (term) term.dispose();
   term = new Terminal({ cols, rows, fontSize, disableStdin: true, cursorBlink: false,
     scrollback: 20000, convertEol: true, theme: { background: '#0d1117' } });
   term.open(box);
@@ -187,22 +189,26 @@ function build() {
 function zoom(d) {
   fontSize = Math.max(8, Math.min(20, fontSize + d));
   try { localStorage.setItem('fontSize', String(fontSize)); } catch (e) {}
-  build();
+  build(true);
 }
 document.getElementById('minus').onclick = () => zoom(-1);
 document.getElementById('plus').onclick = () => zoom(1);
-window.addEventListener('resize', build);
+let resizeTimer = null;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => build(false), 150); });
 
 function render(msg) {
+  const same = lastMsg && lastMsg.data === msg.data;
   lastMsg = msg;
+  statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
+  if (same) return; // unchanged snapshot — don't touch the screen
   const buf = term.buffer.active;
   const follow = buf.viewportY >= buf.baseY; // at the bottom → keep following
   const keep = buf.viewportY;
-  term.reset();
-  term.write(msg.data.replace(/\s+$/, ''), () => {
+  // Clear + redraw in ONE write so xterm paints a single frame; term.reset()
+  // followed by write() showed a blank frame on every update (the flicker).
+  term.write('\x1b[H\x1b[2J\x1b[3J' + msg.data.replace(/\s+$/, ''), () => {
     if (follow) term.scrollToBottom(); else term.scrollToLine(keep);
   });
-  statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
 }
 
 function connect() {
