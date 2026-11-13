@@ -8,7 +8,7 @@ html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font:
 /* The page scrolls natively (momentum, smooth); xterm is sized to the whole snapshot
    so it never scrolls itself — its touch scrolling on phones is line-stepped and jerky. */
 #term { position: absolute; top: calc(var(--top) + 37px); left: 4px; right: 4px; bottom: 0;
-        overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+        overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; overscroll-behavior: none; }
 #term .xterm-viewport { overflow: hidden !important; }
 #term .xterm, #term .xterm-screen, #term canvas { touch-action: pan-y; pointer-events: none; }
 #bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
