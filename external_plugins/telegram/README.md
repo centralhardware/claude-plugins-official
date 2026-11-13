@@ -6,7 +6,7 @@ The MCP server logs into Telegram as a bot and provides tools to Claude to reply
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
+- JDK 21+ — the MCP server is a Kotlin/JVM app (ktgbotapi). `start.sh` builds `build/telegram-channel.jar` with the bundled Gradle wrapper on first launch (and again after a plugin update changes the sources), then runs it.
 
 ## Quick Setup
 > Default pairing flow for a single-user DM bot. See [ACCESS.md](./ACCESS.md) for groups and multi-user setups.

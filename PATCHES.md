@@ -17,6 +17,7 @@ plugin only. Everything that remains is upstream except the commits below.
 | `telegram: move per-topic instructions into the channel meta` | a topic's standing rules ride in a `topic_instructions` attribute instead of being prepended to the message body, so the model still gets them while the transcript shows only what the sender typed |
 | `telegram: add /cancel to interrupt the running turn` | DM-only, allowlist-gated `/cancel` presses Escape in the session's tmux pane (`tmux send-keys -t $CLAUDE_TMUX_SESSION Escape`, default session `claude`) and stops the typing keep-alive. It lives in the server, not a UserPromptSubmit hook like `/clr`, because Claude Code queues prompts that arrive mid-turn — a relayed `/cancel` would only be read after the turn it was meant to stop had ended |
 | `telegram: render markdown tables readably` | outbound `reply`/`edit_message` text with a GitHub-style pipe table is rewritten before sending: a narrow table becomes an aligned monospace block (`<pre>` in html), a wide one becomes one labelled record per row (bold first cell, `header: value` lines, empty cells dropped), so tables stop arriving as raw `\| a \| b \|` noise. Rich `table` blocks use the same renderer in their plain-text fallback. |
+| `telegram: rewrite the server in Kotlin (ktgbotapi)` | see below |
 
 ## `telegram: fix poller lock, 409 bail-out and delivery; add topics + formats`
 
@@ -145,3 +146,37 @@ live API): `paragraph`, `heading` (numeric `size`), `list` (items are `{blocks:[
 no `type`), `details`, `blockquote`, `table` (`cells`, not `rows`), `pre`, `divider`,
 `footer`. `section_heading`, `block_quotation`, `preformatted` and `thinking` are
 receive-side names only and are rejected on send.
+
+## `telegram: rewrite the server in Kotlin (ktgbotapi)`
+
+`server.ts` (Bun + grammY) is replaced by a Kotlin/JVM server under
+`external_plugins/telegram/src/main/kotlin/telegram/`, built with Gradle into
+`build/telegram-channel.jar`. `.mcp.json` runs `start.sh`, which builds the jar
+on first launch (or when the sources are newer than it) and execs `java -jar`.
+Needs JDK 21+; Bun is no longer used.
+
+Every patch above is carried over unchanged in behaviour: access/pairing, the
+poller lock (the holder is recognised by `telegram-channel.jar` *or*
+`server.ts` in its cmdline, so the first Kotlin start can evict a leftover Bun
+poller), 409 bail-out, delivery-failure notice, formats with plain-text
+fallback, topics + `topic_instructions` + `ignore`, typing keep-alive and the
+turn-done sentinel, local command menu, `/cancel`, rich messages, guest
+queries, table rendering, permission relay.
+
+- **Telegram**: ktgbotapi for typed calls (send/edit/react/chat action/files/
+  callbacks/commands) and long polling via `GetUpdatesRaw`. Updates are read as
+  raw JSON so the `<channel>` meta is field-for-field what the TS server built.
+  Rich blocks and guest answers go through a `RawRequest` on the same executor,
+  so the model's blocks reach Telegram exactly as written.
+- **MCP**: hand-written newline-delimited JSON-RPC over stdio (`Mcp.kt`) — the
+  SDKs don't model the experimental `claude/channel` notifications.
+- **New — forwarded messages arrive with their comment.** Telegram delivers a
+  comment and the messages forwarded with it (and every item of an album) as
+  separate updates; each used to start its own turn. Inbound messages from the
+  same sender in the same chat/topic are now held for 1 s (each new part
+  restarts the window) and delivered as one notification: the sender's own text
+  first, then each forwarded part under a `[forwarded from <name>]` line.
+  `message_ids` lists every message covered; extra photos/files appear as
+  `image_path_2`, `attachment_file_id_2`, … A lone forward also gets the label
+  and a `forwarded_from` meta attribute.
+- `ts` keeps the JS `toISOString()` shape (`…T05:45:42.000Z`).
