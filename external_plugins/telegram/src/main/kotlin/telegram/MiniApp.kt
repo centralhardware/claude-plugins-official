@@ -149,17 +149,18 @@ private val PAGE = """
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
 <style>
   html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font: 13px system-ui, sans-serif; }
-  #bar { position: fixed; top: 0; left: 0; right: 0; height: 28px; display: flex; align-items: center;
+  #bar { position: fixed; top: 0; left: 0; right: 0; height: 36px; display: flex; align-items: center;
          gap: 8px; padding: 0 12px; background: #161b22; border-bottom: 1px solid #30363d; z-index: 2; }
   #dot { width: 8px; height: 8px; border-radius: 50%; background: #6e7681; }
   #dot.live { background: #3fb950; }
   #status { flex: 1; color: #8b949e; }
-  #term { position: absolute; top: 29px; left: 0; right: 0; bottom: 0; overflow: auto; }
-  .xterm .xterm-viewport { overflow-y: hidden !important; }
+  #term { position: absolute; top: 37px; left: 4px; right: 4px; bottom: 0; }
+  #bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+                font: 13px system-ui, sans-serif; min-width: 36px; height: 28px; }
 </style>
 </head>
 <body>
-<div id="bar"><span id="dot"></span><span id="status">connecting…</span></div>
+<div id="bar"><span id="dot"></span><span id="status">connecting…</span><button id="minus">A−</button><button id="plus">A+</button></div>
 <div id="term"></div>
 <script>
 const tg = window.Telegram && Telegram.WebApp;
@@ -167,33 +168,40 @@ if (tg) { tg.ready(); tg.expand(); }
 const box = document.getElementById('term');
 const statusEl = document.getElementById('status');
 const dot = document.getElementById('dot');
-let term = null, cols = 0, rows = 0, follow = true;
+// A readable font, lines wrapped to the phone's width — the pane's own width
+// (often 200+ columns) would otherwise shrink the text to nothing.
+let fontSize = 12;
+try { fontSize = parseInt(localStorage.getItem('fontSize')) || 12; } catch (e) {}
+let term = null, lastMsg = null;
 
-box.addEventListener('scroll', () => {
-  follow = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
-});
-
-function setup(c, lines) {
-  const fontSize = Math.max(6, Math.min(14, Math.floor(window.innerWidth / (c * 0.6))));
-  if (!term || c !== cols) {
-    if (term) term.dispose();
-    term = new Terminal({ cols: c, rows: lines, fontSize, disableStdin: true, cursorBlink: false,
-      scrollback: 0, convertEol: true, theme: { background: '#0d1117' } });
-    term.open(box);
-    cols = c;
-  } else if (lines !== rows) {
-    term.resize(c, lines);
-  }
-  rows = lines;
+function build() {
+  if (term) term.dispose();
+  const cols = Math.max(20, Math.floor(box.clientWidth / (fontSize * 0.6)));
+  const rows = Math.max(5, Math.floor(box.clientHeight / (fontSize * 1.2)));
+  term = new Terminal({ cols, rows, fontSize, disableStdin: true, cursorBlink: false,
+    scrollback: 20000, convertEol: true, theme: { background: '#0d1117' } });
+  term.open(box);
+  if (lastMsg) render(lastMsg);
 }
 
+function zoom(d) {
+  fontSize = Math.max(8, Math.min(20, fontSize + d));
+  try { localStorage.setItem('fontSize', String(fontSize)); } catch (e) {}
+  build();
+}
+document.getElementById('minus').onclick = () => zoom(-1);
+document.getElementById('plus').onclick = () => zoom(1);
+window.addEventListener('resize', build);
+
 function render(msg) {
-  const text = msg.data.replace(/\s+$/, '');
-  const lines = Math.max(msg.rows, text.split('\n').length);
-  setup(msg.cols, lines);
+  lastMsg = msg;
+  const buf = term.buffer.active;
+  const follow = buf.viewportY >= buf.baseY; // at the bottom → keep following
+  const keep = buf.viewportY;
   term.reset();
-  term.write(text);
-  if (follow) box.scrollTop = box.scrollHeight;
+  term.write(msg.data.replace(/\s+$/, ''), () => {
+    if (follow) term.scrollToBottom(); else term.scrollToLine(keep);
+  });
   statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
 }
 
@@ -209,6 +217,7 @@ function connect() {
     setTimeout(connect, 2000);
   };
 }
+build();
 connect();
 </script>
 </body>
