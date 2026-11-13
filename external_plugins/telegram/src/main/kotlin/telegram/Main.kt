@@ -138,7 +138,13 @@ private suspend fun pollLoop(inbound: Inbound) {
             } catch (_: Exception) {}
 
             while (!shuttingDown) {
-                val updates = Tg.bot.getUpdates(offset?.let { UpdateId(it) }, timeout = POLL_TIMEOUT_S, allowed_updates = ALLOWED_UPDATES)
+                // ktgbotapi sets the HTTP timeout to the long-poll timeout, so an
+                // idle poll can end in a client timeout — that's an empty poll.
+                val updates = try {
+                    Tg.bot.getUpdates(offset?.let { UpdateId(it) }, timeout = POLL_TIMEOUT_S, allowed_updates = ALLOWED_UPDATES)
+                } catch (e: Exception) {
+                    if (e.isTimeout()) continue else throw e
+                }
                 for (u in updates) {
                     offset = u.updateId.long + 1
                     // A throw in one handler must never stop polling.
@@ -172,6 +178,9 @@ private suspend fun pollLoop(inbound: Inbound) {
         }
     }
 }
+
+fun Throwable.isTimeout(): Boolean =
+    generateSequence(this) { it.cause }.any { it is io.ktor.client.plugins.HttpRequestTimeoutException }
 
 fun main() {
     val token = Config.token

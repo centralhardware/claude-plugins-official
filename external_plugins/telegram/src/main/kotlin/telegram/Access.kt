@@ -41,8 +41,11 @@ fun setOwnerOnly(f: File) {
     try { Files.setPosixFilePermissions(f.toPath(), PosixFilePermissions.fromString("rw-------")) } catch (_: Exception) {}
 }
 
+private val TOKEN_RE = Regex("""bot\d+:[A-Za-z0-9_-]+""")
+
+/** Library messages can carry request URLs — never let the token reach a log. */
 fun log(msg: String) {
-    System.err.println("telegram channel: $msg")
+    System.err.println("telegram channel: ${msg.replace(TOKEN_RE, "bot<token>")}")
 }
 
 @Serializable

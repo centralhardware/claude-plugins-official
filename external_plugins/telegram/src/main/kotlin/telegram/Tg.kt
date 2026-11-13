@@ -29,7 +29,7 @@ object Tg {
         // parse errors we retry as plain text on purpose. Our own handlers log
         // what matters, so keep only its unexpected errors, one line each.
         DefaultKTgBotAPIKSLog = KSLog { level, _, message, throwable ->
-            if (level >= LogLevel.ERROR && throwable !is BotException) log("ktgbotapi: $message${throwable?.let { " ($it)" } ?: ""}")
+            if (level >= LogLevel.ERROR && throwable !is BotException && throwable?.isTimeout() != true) log("ktgbotapi: $message${throwable?.let { " ($it)" } ?: ""}")
         }
         bot = telegramBot(token)
     }
