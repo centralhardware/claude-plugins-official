@@ -26,6 +26,8 @@ import dev.inmo.tgbotapi.types.message.textsources.TextMentionTextSource
 import dev.inmo.tgbotapi.types.queries.callback.DataCallbackQuery
 import dev.inmo.tgbotapi.types.queries.callback.MessageCallbackQuery
 import dev.inmo.tgbotapi.types.reactions.Reaction
+import dev.inmo.tgbotapi.types.MessageThreadId
+import dev.inmo.tgbotapi.extensions.api.chat.forum.deleteForumTopic
 import dev.inmo.tgbotapi.types.update.CallbackQueryUpdate
 import dev.inmo.tgbotapi.types.update.GuestMessageUpdate
 import dev.inmo.tgbotapi.types.update.MessageUpdate
@@ -225,7 +227,7 @@ class Inbound(
         val cmd = token.substringBefore('@').lowercase()
         val target = token.substringAfter('@', "")
         if (target.isNotEmpty() && !target.equals(Tg.username, ignoreCase = true)) return false
-        if (cmd !in setOf("start", "help", "status", "cancel", "ns", "nsend", "sessions")) return false
+        if (cmd !in setOf("start", "help", "status", "cancel", "ns", "nsend", "nsdrop", "sessions")) return false
         val gated = dmCommandGate(msg) ?: return true
         val chatId = msg.chatIdStr
         val threadId = msg.topicThreadId
@@ -247,6 +249,7 @@ class Inbound(
                     "/status — check your pairing state\n" +
                     "/ns <name> — start a separate Claude session in a new topic\n" +
                     "/nsend — stop the session of this topic\n" +
+                    "/nsdrop — stop it and delete its topic\n" +
                     "/sessions — list side sessions",
             )
             "status" -> {
@@ -276,6 +279,17 @@ class Inbound(
                     ?: return say("Not a session topic. Usage: /nsend <name>, or /nsend inside its topic.").let { true }
                 Sessions.end(s)
                 say("🛑 Session \"${s.name}\" stopped. The topic stays for history.")
+            }
+            "nsdrop" -> {
+                val s = (if (arg.isNotEmpty()) Sessions.byName(arg.lowercase()) else side)
+                    ?: return say("Not a session topic. Usage: /nsdrop <name>, or /nsdrop inside its topic.").let { true }
+                Sessions.end(s)
+                val deleted = try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
+                    catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
+                // Inside the dropped topic there's nowhere left to answer.
+                if (threadId != s.threadId || !deleted) {
+                    say(if (deleted) "🗑 Session \"${s.name}\" stopped and its topic deleted." else "🛑 Session \"${s.name}\" stopped, but the topic couldn't be deleted.")
+                }
             }
             "sessions" -> {
                 val list = Sessions.load()
