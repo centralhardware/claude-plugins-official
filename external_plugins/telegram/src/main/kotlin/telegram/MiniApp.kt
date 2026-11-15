@@ -49,7 +49,9 @@ class MiniApp(token: String) {
             embeddedServer(CIO, port = port, host = host) {
                 install(WebSockets) { pingPeriod = 20.seconds }
                 routing {
-                    get("/") { call.respondText(PAGE, ContentType.Text.Html) }
+                    get("/") { asset(call, "index.html", ContentType.Text.Html) }
+                    get("/app.js") { asset(call, "app.js", ContentType.Text.JavaScript) }
+                    get("/app.css") { asset(call, "app.css", ContentType.Text.CSS) }
                     webSocket("/ws") { stream(this) }
                 }
             }.start(wait = false)
@@ -130,96 +132,18 @@ class MiniApp(token: String) {
         ).toString()
     }
 
+    /** Frontend files live in src/main/resources/miniapp/ and ship inside the jar. */
+    private suspend fun asset(call: ApplicationCall, name: String, type: ContentType) {
+        val bytes = assets.getOrPut(name) {
+            MiniApp::class.java.getResourceAsStream("/miniapp/$name")?.use { it.readBytes() } ?: ByteArray(0)
+        }
+        if (bytes.isEmpty()) call.respond(HttpStatusCode.NotFound) else call.respondBytes(bytes, type)
+    }
+    private val assets = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+
     private fun run(vararg cmd: String): String? = try {
         val p = ProcessBuilder(*cmd).redirectErrorStream(false).start()
         val out = p.inputStream.bufferedReader().readText()
         if (p.waitFor(5, TimeUnit.SECONDS) && p.exitValue() == 0) out else null
     } catch (_: Exception) { null }
 }
-
-private val PAGE = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-<title>Claude session</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
-<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-<style>
-  html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font: 13px system-ui, sans-serif; }
-  #bar { position: fixed; top: 0; left: 0; right: 0; height: 36px; display: flex; align-items: center;
-         gap: 8px; padding: 0 12px; background: #161b22; border-bottom: 1px solid #30363d; z-index: 2; }
-  #dot { width: 8px; height: 8px; border-radius: 50%; background: #6e7681; }
-  #dot.live { background: #3fb950; }
-  #status { flex: 1; color: #8b949e; }
-  #term { position: absolute; top: 37px; left: 4px; right: 4px; bottom: 0; }
-  #bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
-                font: 13px system-ui, sans-serif; min-width: 36px; height: 28px; }
-</style>
-</head>
-<body>
-<div id="bar"><span id="dot"></span><span id="status">connecting…</span><button id="minus">A−</button><button id="plus">A+</button></div>
-<div id="term"></div>
-<script>
-const tg = window.Telegram && Telegram.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
-const box = document.getElementById('term');
-const statusEl = document.getElementById('status');
-const dot = document.getElementById('dot');
-// A readable font, lines wrapped to the phone's width — the pane's own width
-// (often 200+ columns) would otherwise shrink the text to nothing.
-let fontSize = 12;
-try { fontSize = parseInt(localStorage.getItem('fontSize')) || 12; } catch (e) {}
-let term = null, lastMsg = null;
-
-function build() {
-  if (term) term.dispose();
-  const cols = Math.max(20, Math.floor(box.clientWidth / (fontSize * 0.6)));
-  const rows = Math.max(5, Math.floor(box.clientHeight / (fontSize * 1.2)));
-  term = new Terminal({ cols, rows, fontSize, disableStdin: true, cursorBlink: false,
-    scrollback: 20000, convertEol: true, theme: { background: '#0d1117' } });
-  term.open(box);
-  if (lastMsg) render(lastMsg);
-}
-
-function zoom(d) {
-  fontSize = Math.max(8, Math.min(20, fontSize + d));
-  try { localStorage.setItem('fontSize', String(fontSize)); } catch (e) {}
-  build();
-}
-document.getElementById('minus').onclick = () => zoom(-1);
-document.getElementById('plus').onclick = () => zoom(1);
-window.addEventListener('resize', build);
-
-function render(msg) {
-  lastMsg = msg;
-  const buf = term.buffer.active;
-  const follow = buf.viewportY >= buf.baseY; // at the bottom → keep following
-  const keep = buf.viewportY;
-  term.reset();
-  term.write(msg.data.replace(/\s+$/, ''), () => {
-    if (follow) term.scrollToBottom(); else term.scrollToLine(keep);
-  });
-  statusEl.textContent = 'live · ' + new Date(msg.ts).toLocaleTimeString();
-}
-
-function connect() {
-  if (!tg || !tg.initData) { statusEl.textContent = 'open this from the bot in Telegram'; return; }
-  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
-  ws.onopen = () => ws.send(tg.initData);
-  ws.onmessage = e => { dot.className = 'live'; render(JSON.parse(e.data)); };
-  ws.onclose = e => {
-    dot.className = '';
-    if (e.code === 4401) { statusEl.textContent = 'not authorized'; return; }
-    statusEl.textContent = 'reconnecting…';
-    setTimeout(connect, 2000);
-  };
-}
-build();
-connect();
-</script>
-</body>
-</html>
-""".trimIndent()
