@@ -13,3 +13,5 @@ html, body { margin: 0; height: 100%; background: #0d1117; color: #c9d1d9; font:
 #term .xterm, #term .xterm-screen, #term canvas { touch-action: pan-y; pointer-events: none; }
 #bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
               font: 13px system-ui, sans-serif; min-width: 36px; height: 28px; }
+#sess { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+        font: 13px system-ui, sans-serif; height: 28px; max-width: 40vw; }

@@ -20,9 +20,11 @@ import kotlin.time.Duration.Companion.seconds
 
 /**
  * Watch-only Mini App: streams the Claude Code tmux pane (with scrollback) to
- * an xterm.js page opened from the bot's menu button. There is no input path —
- * the socket only ever sends frames to the client and ignores anything it
- * receives after authentication.
+ * an xterm.js page opened from the bot's menu button. There is no input path to
+ * claude: after authentication the only message the socket accepts is
+ * {"session": "<name>"} — which pane to watch: "" for the main session, or a
+ * side session started with /ns (see Sessions). Each frame lists the side
+ * sessions so the page can offer them.
  *
  * Auth: the page sends Telegram's signed `initData` as its first socket
  * message. It must carry a valid hash (checked with ktgbotapi's
@@ -100,12 +102,20 @@ class MiniApp(token: String) {
             return
         }
         log("mini app viewer connected: $user")
-        // Drain and ignore anything else the client sends — this view takes no input.
-        val drain = session.launch { for (f in session.incoming) { /* ignored */ } }
+        // The only accepted message picks the pane to watch; anything else is ignored.
+        var current = ""
+        val drain = session.launch {
+            for (f in session.incoming) {
+                val name = try {
+                    Json.parseToJsonElement((f as? Frame.Text)?.readText() ?: continue).jsonObject["session"]?.jsonPrimitive?.content
+                } catch (_: Exception) { null } ?: continue
+                if (name.isEmpty() || Sessions.byName(name) != null) current = name
+            }
+        }
         var last = ""
         try {
             while (session.isActive) {
-                val frame = capture()
+                val frame = capture(current)
                 if (frame != last) {
                     session.send(Frame.Text(frame))
                     last = frame
@@ -119,8 +129,9 @@ class MiniApp(token: String) {
     }
 
     /** One JSON frame: pane size plus the ANSI-coloured pane with scrollback. */
-    private fun capture(): String {
-        val target = Config.tmuxSession
+    private fun capture(name: String): String {
+        val side = name.takeIf { it.isNotEmpty() }?.let { Sessions.byName(it) }
+        val target = side?.tmux ?: Config.tmuxSession
         val size = run("tmux", "display-message", "-p", "-t", target, "#{pane_width} #{pane_height}")
             ?.trim()?.split(' ')?.mapNotNull { it.toIntOrNull() }
         val text = run("tmux", "capture-pane", "-p", "-e", "-J", "-S", "-$history", "-t", target)
@@ -129,6 +140,8 @@ class MiniApp(token: String) {
             "rows" to (size?.getOrNull(1) ?: 24),
             "data" to (text ?: "tmux session \"$target\" is not running"),
             "ts" to System.currentTimeMillis(),
+            "current" to (side?.name ?: ""),
+            "sessions" to JsonArray(Sessions.load().map { json("name" to it.name, "alive" to Sessions.alive(it)) }),
         ).toString()
     }
 

@@ -11,6 +11,29 @@ if (tg) {
 const box = document.getElementById('term');
 const statusEl = document.getElementById('status');
 const dot = document.getElementById('dot');
+// Which pane to watch: '' = main session, else a side session from /ns.
+// A link may preselect one: ?session=<name> or startapp=<name>.
+const sessEl = document.getElementById('sess');
+let wanted = new URLSearchParams(location.search).get('session') || (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || '';
+try { if (!wanted) wanted = localStorage.getItem('session') || ''; } catch (e) {}
+function syncSessions(msg) {
+  const list = msg.sessions || [];
+  sessEl.hidden = list.length === 0;
+  const opts = [['', 'main']].concat(list.map(s => [s.name, (s.alive ? '' : '⚫ ') + s.name]));
+  const sig = JSON.stringify(opts);
+  if (sessEl.dataset.sig !== sig) {
+    sessEl.dataset.sig = sig;
+    sessEl.innerHTML = '';
+    for (const [v, t] of opts) { const o = document.createElement('option'); o.value = v; o.textContent = t; sessEl.appendChild(o); }
+  }
+  sessEl.value = msg.current || '';
+}
+sessEl.onchange = () => {
+  wanted = sessEl.value;
+  try { localStorage.setItem('session', wanted); } catch (e) {}
+  shown = null; pending = false;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ session: wanted }));
+};
 // A readable font, lines wrapped to the phone's width — the pane's own width
 // (often 200+ columns) would otherwise shrink the text to nothing.
 let fontSize = 12;
@@ -105,8 +128,15 @@ function connect() {
   clearTimeout(retry); retry = null;
   if (ws && ws.readyState <= 1) return; // already open or opening
   const sock = ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
-  sock.onopen = () => sock.send(tg.initData);
-  sock.onmessage = e => { dot.className = 'live'; render(JSON.parse(e.data)); };
+  sock.onopen = () => { sock.send(tg.initData); if (wanted) sock.send(JSON.stringify({ session: wanted })); };
+  sock.onmessage = e => {
+    dot.className = 'live';
+    const msg = JSON.parse(e.data);
+    syncSessions(msg);
+    // Frames of the old pane can still be in flight right after a switch.
+    if ((msg.current || '') !== wanted && (msg.sessions || []).some(s => s.name === wanted)) return;
+    render(msg);
+  };
   sock.onclose = e => {
     if (sock !== ws) return;
     dot.className = '';
