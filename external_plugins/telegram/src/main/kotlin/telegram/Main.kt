@@ -220,7 +220,7 @@ fun main() {
         try { if (Config.pidFile.readText().trim().toLong() == myPid) Config.pidFile.delete() } catch (_: Exception) {}
     })
 
-    if (!Config.static) scope.launch {
+    if (!Config.static && !Sessions.isChild) scope.launch {
         while (isActive) {
             inbound.checkApprovals()
             delay(5000)
@@ -244,8 +244,29 @@ fun main() {
         }
     }
 
-    val miniApp = MiniApp(token)
-    scope.launch { pollLoop(inbound, miniApp) }
+    val side = Sessions.selfName
+    if (side == null) {
+        val miniApp = MiniApp(token)
+        scope.launch { pollLoop(inbound, miniApp) }
+    } else {
+        // Side session (/ns): the main server polls and spools this topic's traffic here.
+        log("side session \"$side\" — not polling, reading the spool")
+        Sessions.self()?.let { lastThread[it.chatId] = it.threadId }
+        scope.launch {
+            Sessions.drain(side) { method, params ->
+                if (method == "notifications/claude/channel") {
+                    val meta = params["meta"]?.jsonObject
+                    val chatId = meta?.get("chat_id")?.jsonPrimitive?.content
+                    val thread = meta?.get("thread_id")?.jsonPrimitive?.content?.toLongOrNull()
+                    if (chatId != null) {
+                        thread?.let { lastThread[chatId] = it }
+                        typing.start(chatId, thread)
+                    }
+                }
+                mcp.notify(method, params)
+            }
+        }
+    }
 
     runBlocking {
         mcp.run(scope)

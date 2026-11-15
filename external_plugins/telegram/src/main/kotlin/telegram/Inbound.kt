@@ -83,6 +83,12 @@ class Inbound(
 ) {
     private val pendingPermissions = ConcurrentHashMap<String, Triple<String, String, String>>()
 
+    /** Main session, or the side session bound to this topic (see Sessions). */
+    private fun notifyFor(chatId: String, threadId: Long?, method: String, params: JsonObject) {
+        val side = if (Sessions.isChild) null else Sessions.byThread(chatId, threadId)
+        if (side != null) Sessions.enqueue(side, method, params) else mcp().notify(method, params)
+    }
+
     // ── Gate ─────────────────────────────────────────────────────────────────
 
     private sealed interface Gate {
@@ -219,10 +225,13 @@ class Inbound(
         val cmd = token.substringBefore('@').lowercase()
         val target = token.substringAfter('@', "")
         if (target.isNotEmpty() && !target.equals(Tg.username, ignoreCase = true)) return false
-        if (cmd !in setOf("start", "help", "status", "cancel")) return false
+        if (cmd !in setOf("start", "help", "status", "cancel", "ns", "nsend", "sessions")) return false
         val gated = dmCommandGate(msg) ?: return true
         val chatId = msg.chatIdStr
-        suspend fun say(s: String) = try { Tg.bot.sendMessage(chatIdOf(chatId), s) } catch (e: Exception) { log("command reply failed: ${e.describe()}") }
+        val threadId = msg.topicThreadId
+        val side = Sessions.byThread(chatId, threadId)
+        suspend fun say(s: String) = try { Tg.bot.sendMessage(chatIdOf(chatId), s, threadId = threadOf(threadId)) } catch (e: Exception) { log("command reply failed: ${e.describe()}") }
+        val arg = text.substringAfter(' ', "").trim()
         when (cmd) {
             "start" -> say(
                 "This bot bridges Telegram to a Claude Code session.\n\n" +
@@ -235,7 +244,10 @@ class Inbound(
                 "Messages you send here route to a paired Claude Code session. " +
                     "Text and photos are forwarded; replies and reactions come back.\n\n" +
                     "/start — pairing instructions\n" +
-                    "/status — check your pairing state",
+                    "/status — check your pairing state\n" +
+                    "/ns <name> — start a separate Claude session in a new topic\n" +
+                    "/nsend — stop the session of this topic\n" +
+                    "/sessions — list side sessions",
             )
             "status" -> {
                 val (access, senderId) = gated
@@ -247,7 +259,33 @@ class Inbound(
                     say(if (code != null) "Pending pairing — run in Claude Code:\n\n/telegram:access pair $code" else "Not paired. Send me a message to get a pairing code.")
                 }
             }
-            "cancel" -> {
+            "ns" -> {
+                if (arg.isEmpty()) return say("Usage: /ns <name> — starts a separate Claude session in a new topic.").let { true }
+                Sessions.spawn(scope, arg.lowercase(), chatId).fold(
+                    onSuccess = { s ->
+                        try {
+                            Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" is starting (tmux ${s.tmux}). Messages in this topic go to it; /nsend here stops it.", threadId = threadOf(s.threadId))
+                        } catch (_: Exception) {}
+                        if (threadId != s.threadId) say("Started \"${s.name}\" in its own topic.")
+                    },
+                    onFailure = { say("⚠️ ${it.message ?: it.toString()}") },
+                )
+            }
+            "nsend" -> {
+                val s = (if (arg.isNotEmpty()) Sessions.byName(arg.lowercase()) else side)
+                    ?: return say("Not a session topic. Usage: /nsend <name>, or /nsend inside its topic.").let { true }
+                Sessions.end(s)
+                say("🛑 Session \"${s.name}\" stopped. The topic stays for history.")
+            }
+            "sessions" -> {
+                val list = Sessions.load()
+                say(if (list.isEmpty()) "No side sessions. Start one with /ns <name>."
+                    else list.joinToString("\n") { "${if (Sessions.alive(it)) "🟢" else "⚫"} ${it.name} (tmux ${it.tmux})" })
+            }
+            "cancel" -> if (side != null) {
+                typing.stop(chatId)
+                say(if (Sessions.interrupt(side)) "🛑 Interrupted \"${side.name}\"." else "Couldn't reach tmux session \"${side.tmux}\".")
+            } else {
                 // Interrupt the running turn: Escape into the tmux pane, the same key
                 // a person at the keyboard would press. A relayed message would only
                 // be seen after the turn it was meant to stop.
@@ -283,10 +321,12 @@ class Inbound(
         val requestId = params.str("request_id") ?: return
         val toolName = params.str("tool_name") ?: ""
         pendingPermissions[requestId] = Triple(toolName, params.str("description") ?: "", params.str("input_preview") ?: "")
+        val self = Sessions.self()
         for (chatId in AccessStore.load().allowFrom) {
+            val thread = self?.takeIf { it.chatId == chatId }?.threadId
             scope.launch {
                 try {
-                    Tg.bot.sendMessage(chatIdOf(chatId), "🔐 Permission: $toolName", replyMarkup = permKeyboard(requestId, true))
+                    Tg.bot.sendMessage(chatIdOf(chatId), "🔐 Permission: $toolName", threadId = threadOf(thread), replyMarkup = permKeyboard(requestId, true))
                 } catch (e: Exception) { log("permission_request send to $chatId failed: ${e.describe()}") }
             }
         }
@@ -312,7 +352,8 @@ class Inbound(
         }
 
         try {
-            mcp().notify("notifications/claude/channel/permission", json("request_id" to requestId, "behavior" to behavior))
+            val thread = (message as? PossiblyTopicMessage)?.threadId?.long
+            notifyFor(cq.from.idStr, thread, "notifications/claude/channel/permission", json("request_id" to requestId, "behavior" to behavior))
         } catch (e: Exception) { log("permission verdict not delivered: $e") }
         pendingPermissions.remove(requestId)
         val label = if (behavior == "allow") "✅ Allowed" else "❌ Denied"
@@ -351,7 +392,7 @@ class Inbound(
         PERMISSION_REPLY_RE.matchEntire(part.text)?.let { m ->
             val allow = m.groupValues[1].lowercase().startsWith("y")
             try {
-                mcp().notify("notifications/claude/channel/permission", json("request_id" to m.groupValues[2].lowercase(), "behavior" to if (allow) "allow" else "deny"))
+                notifyFor(chatId, msg.topicThreadId, "notifications/claude/channel/permission", json("request_id" to m.groupValues[2].lowercase(), "behavior" to if (allow) "allow" else "deny"))
             } catch (e: Exception) { log("permission verdict not delivered: $e") }
             scope.launch {
                 try { Tg.bot.setMessageReaction(chatIdOf(chatId), msgIdOf(msgId), Reaction.Emoji(if (allow) "✅" else "❌")) } catch (_: Exception) {}
@@ -364,7 +405,8 @@ class Inbound(
         val topic = topicConfig(chatId, threadId)
         if (topic?.ignore == true) return // send-only topic
 
-        typing.start(chatId, threadId)
+        // A side session's own server shows typing for its turns.
+        if (Sessions.byThread(chatId, threadId) == null) typing.start(chatId, threadId)
         val ack = access.ackReaction
         if (!ack.isNullOrEmpty()) scope.launch {
             try { Tg.bot.setMessageReaction(chatIdOf(chatId), msgIdOf(msgId), Reaction.Emoji(ack)) } catch (_: Exception) {}
@@ -435,7 +477,7 @@ class Inbound(
         }
 
         try {
-            mcp().notify("notifications/claude/channel", json("content" to content, "meta" to meta))
+            notifyFor(batch.chatId, batch.threadId, "notifications/claude/channel", json("content" to content, "meta" to meta))
         } catch (e: Exception) {
             // The ack and typing already said "received" — don't leave them waiting.
             log("failed to deliver inbound to Claude: $e")
