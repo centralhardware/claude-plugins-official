@@ -253,6 +253,14 @@ fun main() {
         log("side session \"$side\" — not polling, reading the spool")
         Sessions.self()?.let { lastThread[it.chatId] = it.threadId }
         scope.launch {
+            // Don't hand spooled messages over before Claude Code can take them: a
+            // notification sent before the MCP handshake completes, or while the
+            // startup prompts (dev channels, trust) are still on screen, is dropped
+            // silently — and drain() deletes the file. The first message typed into a
+            // fresh topic always lands in that window.
+            mcp.initialized.await()
+            delay(Sessions.startupGraceMs)
+            log("side session \"$side\" — ready, draining the spool")
             Sessions.drain(side) { method, params ->
                 if (method == "notifications/claude/channel") {
                     val meta = params["meta"]?.jsonObject

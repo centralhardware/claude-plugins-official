@@ -25,6 +25,9 @@ class McpServer(
     @Volatile var closed = false
         private set
 
+    /** Completes on the client's `notifications/initialized` — before that, notifications are dropped. */
+    val initialized = CompletableDeferred<Unit>()
+
     init {
         // Anything printed to System.out by a library would corrupt the protocol stream.
         System.setOut(System.err)
@@ -69,6 +72,7 @@ class McpServer(
         val params = msg.o("params") ?: JsonObject(emptyMap())
         if (method == null) return // a response to something we sent — we send no requests
         if (id == null || id is JsonNull) {
+            if (method == "notifications/initialized") initialized.complete(Unit)
             try { onNotification(method, params) } catch (e: Exception) { log("notification $method failed: $e") }
             return
         }
