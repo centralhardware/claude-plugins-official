@@ -102,6 +102,9 @@ object Sessions {
     private val promptKeys get() = (Config.env("TELEGRAM_SESSION_PROMPT_KEYS") ?: "Down Enter;Enter")
         .split(';').map { it.trim().split(Regex("\\s+")).filter(String::isNotEmpty) }.filter { it.isNotEmpty() }
 
+    /** How long a side session's server holds its spool after the MCP handshake: the prompts are answered 8 s apart. */
+    val startupGraceMs get() = (promptKeys.size + 1) * 8000L
+
     /** Creates the topic, registers it, starts claude. Returns the session or an error text. */
     suspend fun spawn(scope: CoroutineScope, name: String, chatId: String): Result<NamedSession> = runCatching {
         require(NAME_RE.matches(name)) { "Name must be 1–32 chars: a-z, 0-9, - or _." }
