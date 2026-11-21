@@ -147,6 +147,51 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                 "required" to listOf("chat_id", "name", "message"),
             ),
         ))
+        if (!Sessions.isChild) add(json(
+            "name" to "list_sessions",
+            "description" to "List the running side sessions (name, topic thread, alive). Check it before spawn_session: a Main message that belongs to one of them should go there with forward_to_session, not start a new one.",
+            "inputSchema" to json("type" to "object", "properties" to json()),
+        ))
+        if (!Sessions.isChild) add(json(
+            "name" to "forward_to_session",
+            "description" to "Move a message the user posted in Main by mistake into an existing side session: it is delivered there as a normal turn, and a copy is posted in that topic so the user sees where it went.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json(
+                    "chat_id" to json("type" to "string"),
+                    "name" to json("type" to "string", "description" to "Side session name (from list_sessions)."),
+                    "message" to json("type" to "string", "description" to "The user's message, verbatim."),
+                    "image_path" to json("type" to "string"),
+                    "attachment_file_id" to json("type" to "string"),
+                ),
+                "required" to listOf("chat_id", "name", "message"),
+            ),
+        ))
+    }
+
+    private fun listSessions(): JsonObject = text(Sessions.load().joinToString("\n") {
+        "${it.name} thread=${it.threadId} ${if (Sessions.alive(it)) "alive" else "dead"}"
+    }.ifEmpty { "no side sessions" })
+
+    private fun handOff(s: NamedSession, chatId: String, message: String, args: JsonObject) {
+        val meta = buildJsonObject {
+            put("chat_id", chatId); put("thread_id", s.threadId.toString()); put("topic", "🤖 ${s.name}")
+            put("ts", java.time.Instant.now().toString()); put("moved_from", "Main")
+            args.anyStr("image_path")?.let { put("image_path", it) }
+            args.anyStr("attachment_file_id")?.let { put("attachment_file_id", it) }
+        }
+        Sessions.enqueue(s, "notifications/claude/channel", buildJsonObject { put("content", message); put("meta", meta) })
+    }
+
+    private suspend fun forwardToSession(args: JsonObject): JsonObject {
+        val chatId = args.anyStr("chat_id") ?: throw IllegalArgumentException("chat_id required")
+        val name = (args.anyStr("name") ?: throw IllegalArgumentException("name required")).lowercase()
+        val message = args.anyStr("message") ?: throw IllegalArgumentException("message required")
+        val s = Sessions.byName(name)?.takeIf { Sessions.alive(it) }
+            ?: return text("no live side session \"$name\"; running: ${Sessions.load().filter { Sessions.alive(it) }.joinToString { it.name }.ifEmpty { "none" }}", error = true)
+        Tg.bot.sendMessage(chatIdOf(chatId), "↪️ Moved from Main:\n$message".take(MAX_CHUNK_LIMIT), threadId = threadOf(s.threadId))
+        handOff(s, chatId, message, args)
+        return text("forwarded to session ${s.name}")
     }
 
     private suspend fun spawnSession(args: JsonObject): JsonObject {
@@ -156,13 +201,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         val s = Sessions.spawn(scope, name, chatId).getOrElse { return text("spawn_session failed: ${it.message}", error = true) }
         Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" started for this subject. Messages in this topic go to it; /nsend here stops it.", threadId = threadOf(s.threadId))
         // Spooled now; the child drains it once its own server is up (startup grace covers the prompts).
-        val meta = buildJsonObject {
-            put("chat_id", chatId); put("thread_id", s.threadId.toString()); put("topic", "🤖 ${s.name}")
-            put("ts", java.time.Instant.now().toString()); put("moved_from", "Main")
-            args.anyStr("image_path")?.let { put("image_path", it) }
-            args.anyStr("attachment_file_id")?.let { put("attachment_file_id", it) }
-        }
-        Sessions.enqueue(s, "notifications/claude/channel", buildJsonObject { put("content", message); put("meta", meta) })
+        handOff(s, chatId, message, args)
         return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it")
     }
 
@@ -176,6 +215,8 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "download_attachment" -> text(downloadToInbox(args.anyStr("file_id") ?: throw IllegalArgumentException("file_id required")))
             "edit_message" -> edit(args)
             "spawn_session" -> spawnSession(args)
+            "list_sessions" -> listSessions()
+            "forward_to_session" -> forwardToSession(args)
             else -> text("unknown tool: $name", error = true)
         }
     } catch (e: Exception) {
