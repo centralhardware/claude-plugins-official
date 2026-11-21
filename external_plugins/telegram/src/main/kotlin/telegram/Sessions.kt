@@ -248,19 +248,24 @@ object Sessions {
             }?.trim()
             if (text.isNullOrEmpty() || text.startsWith("<system-reminder>")) null else "[$role] $text"
         }
-        return parts.joinToString("\n\n").takeLast(maxChars)
+        // PR/release/commit URLs live in tool output, which is dropped above: list them so the summary can link.
+        val urls = Regex("""https://github\.com/[\w.-]+/[\w.-]+/(?:pull/\d+|releases/tag/[\w.%-]+|commit/[0-9a-f]{7,40})""")
+            .findAll(f.readText().replace("\\/", "/")).map { it.value }.distinct().toList().takeLast(30)
+        val links = if (urls.isEmpty()) "" else "\n\n[links seen in tool output]\n" + urls.joinToString("\n")
+        return parts.joinToString("\n\n").takeLast(maxChars - links.length) + links
     }
 
     /** A short summary via headless `claude -p`; Result.failure carries a reason for the user. */
     suspend fun summarize(f: File): Result<String> = withContext(Dispatchers.IO) {
         val text = dialogue(f).ifBlank { return@withContext Result.failure(Exception("empty transcript")) }
         val prompt = "Summarize this Claude Code session for its owner. English, addressed to them as \"you\", formatted as Telegram HTML " +
-            "(only <b>, <i>, <code>, <a href>, <blockquote expandable>; • for bullets; escape & < > in plain text; no markdown). Structure: " +
-            "one or two sentences on what the session was about and what came of it — its meaning, not a play-by-play, no thread ids or Telegram details; " +
-            "then <b>Needs you</b>: decisions or approvals still waiting on the owner, each one line, most important first; " +
-            "then <b>Done</b>: at most 5 one-line bullets of outcomes (PRs/commits as links when the transcript has the URL), " +
-            "with any finer detail folded into one <blockquote expandable>. Skip a section that would be empty. Never include secret values. " +
-            "Output only the summary: no heading, preamble, English corrections or footers. The transcript follows on stdin."
+            "(only <b>, <i>, <code>, <a href>, <blockquote expandable>; • for bullets; escape & < > in plain text; no markdown). Exact order: " +
+            "1) <b>Needs you</b>: decisions, approvals or actions still waiting on the owner, one line each, most important first (omit if none); " +
+            "2) one or two sentences on what the session was about and what came of it — its meaning, not a play-by-play, no thread ids or Telegram details; " +
+            "3) <b>Done</b>: at most 5 one-line outcome bullets; every PR, release or commit mentioned must be an <a href> link, " +
+            "using the URLs from the transcript or the [links seen in tool output] list; " +
+            "4) everything else (numbers, caveats, side notes) goes inside ONE <blockquote expandable> at the end — no loose paragraphs after Done. " +
+            "Never include secret values. Output only the summary: no heading, preamble, English corrections or footers. The transcript follows on stdin."
         try {
             val cmd = (Config.env("TELEGRAM_SUMMARY_CMD") ?: "claude -p --model sonnet").split(Regex("\\s+")) + prompt
             val pb = ProcessBuilder(cmd).directory(File(System.getProperty("user.home")))
