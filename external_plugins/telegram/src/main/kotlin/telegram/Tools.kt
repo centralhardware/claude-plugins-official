@@ -12,6 +12,11 @@ import dev.inmo.tgbotapi.requests.abstracts.InputFile
 import dev.inmo.tgbotapi.types.ReplyParameters
 import dev.inmo.tgbotapi.requests.abstracts.FileId
 import dev.inmo.tgbotapi.types.reactions.Reaction
+import dev.inmo.tgbotapi.extensions.api.send.polls.sendRegularPoll
+import dev.inmo.tgbotapi.types.buttons.InlineKeyboardButtons.CallbackDataInlineKeyboardButton
+import dev.inmo.tgbotapi.types.buttons.InlineKeyboardMarkup
+import dev.inmo.tgbotapi.types.buttons.KeyboardMarkup
+import dev.inmo.tgbotapi.types.polls.InputPollOption
 import kotlinx.serialization.json.*
 import java.io.File
 
@@ -39,10 +44,10 @@ fun replyParams(chatId: String, messageId: Long?): ReplyParameters? =
     messageId?.let { ReplyParameters(chatIdOf(chatId), msgIdOf(it)) }
 
 /** sendMessage with the plain-text fallback: a stray '*' must not lose the message. */
-suspend fun sendText(chatId: String, text: String, threadId: Long?, replyTo: Long?, fmt: Fmt?): Long {
+suspend fun sendText(chatId: String, text: String, threadId: Long?, replyTo: Long?, fmt: Fmt?, markup: KeyboardMarkup? = null): Long {
     suspend fun go(f: Fmt?) = Tg.bot.sendMessage(
         chatIdOf(chatId), text, parseMode = f.toParseMode(),
-        threadId = threadOf(threadId), replyParameters = replyParams(chatId, replyTo),
+        threadId = threadOf(threadId), replyParameters = replyParams(chatId, replyTo), replyMarkup = markup,
     ).messageId.long
     return try { go(fmt) } catch (e: Exception) {
         if (fmt == null || !e.isParseErr()) throw e
@@ -93,6 +98,12 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                     "thread_id" to json("type" to "string", "description" to "Forum topic to post into. Use thread_id from the inbound <channel> block. Omitted → the topic the last inbound message from this chat came from."),
                     "files" to json("type" to "array", "items" to json("type" to "string"), "description" to "Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each."),
                     "format" to json("type" to "string", "enum" to FORMATS, "description" to FORMAT_DESC),
+                    "buttons" to json(
+                        "type" to "array", "items" to json(),
+                        "description" to "Inline buttons under the message, for a question with fixed answers: [\"Yes\",\"No\"] (one per row) or [[\"Yes\",\"No\"],[\"Later\"]] (rows). " +
+                            "A tap arrives later as a new <channel> event with event=\"button\" and button=<label>; the buttons are then removed so it can't be answered twice. " +
+                            "End the turn after asking — don't wait for the tap. Needs text (not rich).",
+                    ),
                 ),
                 "required" to listOf("chat_id"),
             ),
@@ -127,6 +138,22 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                     "format" to json("type" to "string", "enum" to FORMATS, "description" to FORMAT_DESC),
                 ),
                 "required" to listOf("chat_id", "message_id", "text"),
+            ),
+        ))
+        add(json(
+            "name" to "send_poll",
+            "description" to "Send a Telegram poll. It is non-anonymous, so each vote arrives later as a <channel> event with event=\"poll_answer\" " +
+                "(chosen = the picked options; empty when a vote is retracted). Useful in group chats to collect everyone's choice.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json(
+                    "chat_id" to json("type" to "string"),
+                    "question" to json("type" to "string"),
+                    "options" to json("type" to "array", "items" to json("type" to "string"), "description" to "2–12 answer options."),
+                    "multiple" to json("type" to "boolean", "description" to "Allow picking several options."),
+                    "thread_id" to json("type" to "string", "description" to "Forum topic; omitted → the topic of the last inbound message."),
+                ),
+                "required" to listOf("chat_id", "question", "options"),
             ),
         ))
         // Side sessions are spawned by the main session only; a child can't nest them.
@@ -214,6 +241,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "react" -> react(args)
             "download_attachment" -> text(downloadToInbox(args.anyStr("file_id") ?: throw IllegalArgumentException("file_id required")))
             "edit_message" -> edit(args)
+            "send_poll" -> sendPoll(args)
             "spawn_session" -> spawnSession(args)
             "list_sessions" -> listSessions()
             "forward_to_session" -> forwardToSession(args)
@@ -233,6 +261,12 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         val replyTo = args.anyStr("reply_to")?.toLongOrNull()
         val files = args.arr("files")?.mapNotNull { (it as? JsonPrimitive)?.content }.orEmpty()
         val fmt = fmtOf(format)
+        val buttons = parseButtons(args["buttons"])
+        if (buttons != null && rich != null) throw IllegalArgumentException("buttons need a text reply, not rich")
+        val markup = buttons?.let { rows ->
+            var i = 0
+            InlineKeyboardMarkup(rows.map { row -> row.map { CallbackDataInlineKeyboardButton(it.take(64), "$ASK_PREFIX${i++}") } })
+        }
 
         // Guest turn: one inline message per query; a second reply edits it.
         Guests.get(chatId)?.let { guest ->
@@ -283,7 +317,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             try {
                 chunks.forEachIndexed { i, part ->
                     val rt = threadReply.takeIf { replyMode == "all" || i == 0 }
-                    sent += sendText(chatId, part, threadId, rt, fmt)
+                    sent += sendText(chatId, part, threadId, rt, fmt, markup.takeIf { i == chunks.lastIndex })
                 }
             } catch (e: Exception) {
                 throw IllegalStateException("reply failed after ${sent.size} of ${chunks.size} chunk(s) sent: ${e.describe()}")
@@ -302,7 +336,26 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             sent += msg.messageId.long
         }
 
+        sent.forEach { rememberSent(chatId, it, threadId) }
         return text(if (sent.size == 1) "sent (id: ${sent[0]})" else "sent ${sent.size} parts (ids: ${sent.joinToString(", ")})")
+    }
+
+    private suspend fun sendPoll(args: JsonObject): JsonObject {
+        val chatId = args.anyStr("chat_id") ?: throw IllegalArgumentException("chat_id required")
+        if (chatId.startsWith("guest:")) throw IllegalStateException("polls can't be sent in a guest chat")
+        AccessStore.assertAllowedChat(chatId)
+        val question = args.anyStr("question") ?: throw IllegalArgumentException("question required")
+        val options = args.arr("options")?.map { it.jsonPrimitive.content }.orEmpty()
+        if (options.size !in 2..12) throw IllegalArgumentException("a poll needs 2–12 options")
+        val threadId = args.anyStr("thread_id")?.toLongOrNull() ?: lastThread[chatId]
+        val msg = Tg.bot.sendRegularPoll(
+            chatIdOf(chatId), question, options.map { InputPollOption(it) },
+            isAnonymous = false, allowsMultipleAnswers = args.bool("multiple") == true, threadId = threadOf(threadId),
+        )
+        val id = msg.messageId.long
+        Polls.put(msg.content.poll.id.string, PollRef(chatId, threadId, id, question, options))
+        rememberSent(chatId, id, threadId)
+        return text("poll sent (id: $id)")
     }
 
     private suspend fun react(args: JsonObject): JsonObject {
