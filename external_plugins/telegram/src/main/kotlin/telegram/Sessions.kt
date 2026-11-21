@@ -84,8 +84,13 @@ object Sessions {
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     private fun tmux(vararg args: String): Boolean = try {
-        ProcessBuilder("tmux", *args).redirectErrorStream(true)
-            .redirectOutput(ProcessBuilder.Redirect.DISCARD).start().waitFor() == 0
+        val p = ProcessBuilder("tmux", *args).redirectErrorStream(true)
+            .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))).start()
+        val out = p.inputStream.bufferedReader().readText().trim()
+        (p.waitFor() == 0).also { ok ->
+            // has-session failing is the normal "not alive" answer, not an error.
+            if (!ok && args.firstOrNull() != "has-session") log("tmux ${args.firstOrNull()} exited ${p.exitValue()}: $out")
+        }
     } catch (e: Exception) {
         log("tmux ${args.firstOrNull()} failed: $e"); false
     }
