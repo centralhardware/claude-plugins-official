@@ -250,6 +250,7 @@ fun main() {
     if (side == null) {
         val miniApp = MiniApp(token)
         scope.launch { pollLoop(inbound, miniApp) }
+        Scheduled.start(scope) { ownsPollerLock && !shuttingDown }
     } else {
         // Side session (/ns): the main server polls and spools this topic's traffic here.
         log("side session \"$side\" — not polling, reading the spool")

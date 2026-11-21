@@ -10,7 +10,8 @@ when it is missing or older than the sources, then execs `java -jar`.
 | `Main.kt` | entry point, model instructions, long polling, poller lock, shutdown and orphan watchdog |
 | `Mcp.kt` | newline-delimited JSON-RPC over stdio (initialize, tools, `claude/channel` notifications) |
 | `Inbound.kt` | typed update dispatch: access gate, commands, permission relay, batching, guest queries |
-| `Tools.kt` | `reply`, `react`, `download_attachment`, `edit_message` |
+| `Tools.kt` | `reply`, `react`, `download_attachment`, `edit_message`, `send_poll`, sessions, `schedule_message` / `list_scheduled` / `cancel_scheduled` |
+| `Scheduled.kt` | `scheduled.json` queue (file-locked, shared with side sessions) and the sender loop for `schedule_message` |
 | `Guests.kt` | guest-query state and answers; typing keep-alive |
 | `Access.kt` | `access.json`, `.env`, topics/commands config |
 | `Format.kt` | parse modes, chunking, rich-block plain-text fallback |

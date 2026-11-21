@@ -156,6 +156,37 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                 "required" to listOf("chat_id", "question", "options"),
             ),
         ))
+        add(json(
+            "name" to "schedule_message",
+            "description" to "Queue a text message to be sent to a Telegram chat later. Pass exactly one of at (ISO-8601 with an offset, e.g. 2026-11-21T18:00:00+07:00) or in_minutes. " +
+                "The queue is persisted, so it survives a restart; delivery is checked every ~10 s. Returns the id for cancel_scheduled.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json(
+                    "chat_id" to json("type" to "string"),
+                    "text" to json("type" to "string"),
+                    "at" to json("type" to "string", "description" to "When to send: ISO-8601 with an offset (or epoch seconds)."),
+                    "in_minutes" to json("type" to "number", "description" to "Alternative to at: minutes from now."),
+                    "thread_id" to json("type" to "string", "description" to "Forum topic; omitted → the topic of the last inbound message."),
+                    "format" to json("type" to "string", "enum" to FORMATS, "description" to FORMAT_DESC),
+                ),
+                "required" to listOf("chat_id", "text"),
+            ),
+        ))
+        add(json(
+            "name" to "list_scheduled",
+            "description" to "List pending scheduled messages (id, send time, chat, topic, text preview). Optionally filter by chat_id.",
+            "inputSchema" to json("type" to "object", "properties" to json("chat_id" to json("type" to "string"))),
+        ))
+        add(json(
+            "name" to "cancel_scheduled",
+            "description" to "Cancel a pending scheduled message by the id schedule_message returned.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json("id" to json("type" to "string")),
+                "required" to listOf("id"),
+            ),
+        ))
         // Side sessions are spawned by the main session only; a child can't nest them.
         if (!Sessions.isChild) add(json(
             "name" to "spawn_session",
@@ -232,6 +263,30 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it")
     }
 
+    private fun scheduleMessage(args: JsonObject): JsonObject {
+        val chatId = args.anyStr("chat_id") ?: throw IllegalArgumentException("chat_id required")
+        if (chatId.startsWith("guest:")) throw IllegalStateException("messages can't be scheduled into a guest chat")
+        AccessStore.assertAllowedChat(chatId)
+        val body = args.anyStr("text")?.takeIf { it.isNotBlank() } ?: throw IllegalArgumentException("text required")
+        val inMinutes = args["in_minutes"]?.let { (it as? JsonPrimitive)?.content?.toDoubleOrNull() ?: throw IllegalArgumentException("in_minutes must be a number") }
+        val sendAt = Scheduled.parseWhen(args.anyStr("at"), inMinutes)
+        val format = args.str("format")
+        val threadId = args.anyStr("thread_id")?.toLongOrNull() ?: lastThread[chatId]
+        val msg = ScheduledMsg(Scheduled.newId(), chatId, threadId, body, format, sendAt)
+        Scheduled.add(msg)
+        return text("scheduled (id: ${msg.id}) for ${java.time.Instant.ofEpochMilli(sendAt)}")
+    }
+
+    private fun listScheduled(args: JsonObject): JsonObject = text(Scheduled.list(args.anyStr("chat_id")).joinToString("\n") {
+        val preview = it.text.replace('\n', ' ').let { t -> if (t.length > 60) t.take(60) + "…" else t }
+        "${it.id} at=${java.time.Instant.ofEpochMilli(it.sendAt)} chat=${it.chatId}${it.threadId?.let { t -> " thread=$t" } ?: ""} \"$preview\""
+    }.ifEmpty { "no scheduled messages" })
+
+    private fun cancelScheduled(args: JsonObject): JsonObject {
+        val id = args.anyStr("id") ?: throw IllegalArgumentException("id required")
+        return Scheduled.cancel(id)?.let { text("cancelled $id") } ?: text("no scheduled message with id $id", error = true)
+    }
+
     private fun text(s: String, error: Boolean = false) =
         json("content" to listOf(json("type" to "text", "text" to s)), "isError" to if (error) true else null)
 
@@ -245,6 +300,9 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "spawn_session" -> spawnSession(args)
             "list_sessions" -> listSessions()
             "forward_to_session" -> forwardToSession(args)
+            "schedule_message" -> scheduleMessage(args)
+            "list_scheduled" -> listScheduled(args)
+            "cancel_scheduled" -> cancelScheduled(args)
             else -> text("unknown tool: $name", error = true)
         }
     } catch (e: Exception) {
