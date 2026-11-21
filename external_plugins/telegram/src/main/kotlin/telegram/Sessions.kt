@@ -265,7 +265,9 @@ object Sessions {
             "3) <b>Done</b>: at most 5 one-line outcome bullets; every PR, release or commit mentioned must be an <a href> link, " +
             "using the URLs from the transcript or the [links seen in tool output] list; " +
             "4) everything else (numbers, caveats, side notes) inside ONE <blockquote expandable>; " +
-            "5) last, <b>Needs you</b>: decisions, approvals or actions still waiting on the owner, one line each, most important first (omit if none). " +
+            "5) last, <b>Needs you</b>: only real blockers — something that stays broken or unfinished until the owner acts. At most 3, one short line each, " +
+            "most important first; omit the section if there are none. Optional offers, nice-to-haves, open questions and things to consider " +
+            "are not blockers: leave them out or mention them briefly in the expandable quote. " +
             "Never include secret values. Output only the summary: no heading, preamble, English corrections or footers. The transcript follows on stdin."
         try {
             val cmd = (Config.env("TELEGRAM_SUMMARY_CMD") ?: "claude -p --model sonnet").split(Regex("\\s+")) + prompt
