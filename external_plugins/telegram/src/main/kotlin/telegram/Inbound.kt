@@ -29,6 +29,14 @@ import dev.inmo.tgbotapi.types.reactions.Reaction
 import dev.inmo.tgbotapi.types.MessageThreadId
 import dev.inmo.tgbotapi.extensions.api.chat.forum.deleteForumTopic
 import dev.inmo.tgbotapi.types.update.CallbackQueryUpdate
+import dev.inmo.tgbotapi.types.update.ChatMessageReactionUpdatedUpdate
+import dev.inmo.tgbotapi.types.update.EditMessageUpdate
+import dev.inmo.tgbotapi.types.update.PollAnswerUpdate
+import dev.inmo.tgbotapi.types.chat.Chat
+import dev.inmo.tgbotapi.types.chat.ChatMessageReactionUpdated
+import dev.inmo.tgbotapi.types.polls.PollAnswer
+import dev.inmo.tgbotapi.types.message.abstracts.PossiblyMarkedUp
+import dev.inmo.tgbotapi.extensions.api.edit.reply_markup.editMessageReplyMarkup
 import dev.inmo.tgbotapi.types.update.GuestMessageUpdate
 import dev.inmo.tgbotapi.types.update.MessageUpdate
 import dev.inmo.tgbotapi.types.update.abstracts.Update
@@ -168,6 +176,9 @@ class Inbound(
             is GuestMessageUpdate -> onGuest(update.data)
             is MessageUpdate -> (update.data as? ContentMessage<*>)?.let { onMessage(it) }
             is CallbackQueryUpdate -> (update.data as? DataCallbackQuery)?.let { onCallback(it) }
+            is EditMessageUpdate -> (update.data as? ContentMessage<*>)?.let { onEdit(it) }
+            is PollAnswerUpdate -> onPollAnswer(update.data)
+            is ChatMessageReactionUpdatedUpdate -> onReaction(update.data)
             else -> {}
         }
     }
@@ -348,6 +359,7 @@ class Inbound(
 
     private suspend fun onCallback(cq: DataCallbackQuery) {
         suspend fun answer(text: String? = null) = try { Tg.bot.answerCallbackQuery(cq.id, text) } catch (_: Exception) {}
+        if (cq.data.startsWith(ASK_PREFIX)) return onButton(cq, ::answer)
         val m = PERM_CALLBACK_RE.matchEntire(cq.data) ?: return answer()
         if (cq.from.idStr !in AccessStore.load().allowFrom) return answer("Not authorized.")
         val (behavior, requestId) = m.destructured
@@ -377,6 +389,111 @@ class Inbound(
         if (message != null && original != null) {
             try { Tg.bot.editMessageText(message.chat.id, message.messageId, "$original\n\n$label") } catch (_: Exception) {}
         }
+    }
+
+    // ── Events on the bot's own messages: button taps, poll votes, reactions, edits ──
+
+    /** Allowlist check without the pairing side effects of gate(): these events never start a pairing. */
+    private fun senderAllowed(chat: Chat, senderId: String): Boolean {
+        val access = AccessStore.load()
+        if (access.dmPolicy == "disabled") return false
+        return when (chat) {
+            is PrivateChat -> senderId in access.allowFrom
+            is GroupChat -> {
+                val policy = access.groups[chat.id.chatId.long.toString()] ?: return false
+                policy.allowFrom.isEmpty() || senderId in policy.allowFrom
+            }
+            else -> false
+        }
+    }
+
+    private fun emitEvent(chatId: String, threadId: Long?, content: String, user: User, meta: Map<String, String?>) {
+        val full = LinkedHashMap<String, String>()
+        full["chat_id"] = chatId
+        threadId?.let { full["thread_id"] = it.toString() }
+        full["user"] = user.handle
+        full["user_id"] = user.idStr
+        full["ts"] = isoTs(System.currentTimeMillis())
+        for ((k, v) in meta) if (v != null) full[k] = v
+        typing.start(chatId, threadId)
+        try {
+            notifyFor(chatId, threadId, "notifications/claude/channel", json("content" to content, "meta" to full))
+        } catch (e: Exception) {
+            log("event not delivered: ${e.describe()}")
+            typing.stop(chatId)
+        }
+    }
+
+    private suspend fun onButton(cq: DataCallbackQuery, answer: suspend (String?) -> Unit) {
+        val message = (cq as? MessageCallbackQuery)?.message ?: return answer(null)
+        if (!senderAllowed(message.chat, cq.from.idStr)) return answer("Not authorized.")
+        val keyboard = (message as? PossiblyMarkedUp)?.replyMarkup?.keyboard.orEmpty().flatten()
+        val label = keyboard.filterIsInstance<CallbackDataInlineKeyboardButton>().firstOrNull { it.callbackData == cq.data }?.text
+            ?: return answer("This question has expired.")
+        answer("✓ $label")
+        // Single-use: drop the keyboard so the question can't be answered twice.
+        try { Tg.bot.editMessageReplyMarkup(message.chat.id, message.messageId, replyMarkup = null) } catch (_: Exception) {}
+        val chatId = message.chatIdStr
+        val thread = message.topicThreadId
+        val question = ((message as? ContentMessage<*>)?.content as? TextedContent)?.text
+        emitEvent(chatId, thread, "[tapped button: $label]", cq.from, mapOf(
+            "event" to "button",
+            "button" to safeName(label),
+            "message_id" to message.idLong.toString(),
+            "reply_to_message_id" to message.idLong.toString(),
+            "reply_to_text" to safeName(question)?.take(500),
+        ))
+    }
+
+    private fun onPollAnswer(pa: PollAnswer) {
+        val ref = Polls.get(pa.pollId.string) ?: return
+        val user = pa.user
+        val chat = AccessStore.load()
+        // A poll answer carries no chat; the allowlist of the chat the poll went to applies.
+        val allowed = if (ref.chatId.startsWith("-")) {
+            val policy = chat.groups[ref.chatId]
+            policy != null && (policy.allowFrom.isEmpty() || user.idStr in policy.allowFrom)
+        } else user.idStr in chat.allowFrom
+        if (!allowed) return
+        val chosen = pa.chosen.mapNotNull { ref.options.getOrNull(it) }
+        val content = if (chosen.isEmpty()) "[retracted poll vote: ${ref.question}]"
+        else "[poll vote: ${chosen.joinToString(", ")}] — ${ref.question}"
+        emitEvent(ref.chatId, ref.threadId, content, user, mapOf(
+            "event" to "poll_answer",
+            "message_id" to ref.messageId.toString(),
+            "poll_question" to safeName(ref.question),
+            "chosen" to safeName(chosen.joinToString(" | ")),
+        ))
+    }
+
+    private fun onReaction(r: ChatMessageReactionUpdated) {
+        val user = (r as? ChatMessageReactionUpdated.ByUser)?.reactedUser ?: return
+        if (!senderAllowed(r.chat, user.idStr)) return
+        fun Reaction.label() = (this as? Reaction.Emoji)?.emoji ?: (this as? Reaction.CustomEmoji)?.let { "custom_emoji" } ?: type
+        val old = r.old.map { it.label() }
+        val added = r.new.map { it.label() }.filter { it !in old }
+        // Removals carry no signal worth a turn.
+        if (added.isEmpty()) return
+        val chatId = r.chat.id.chatId.long.toString()
+        val messageId = r.messageId.long
+        emitEvent(chatId, threadOfSent(chatId, messageId), "[reacted ${added.joinToString(" ")} to message $messageId]", user, mapOf(
+            "event" to "reaction",
+            "reaction" to added.joinToString(" "),
+            "message_id" to messageId.toString(),
+        ))
+    }
+
+    private fun onEdit(msg: ContentMessage<*>) {
+        val from = msg.sender ?: return
+        if (!senderAllowed(msg.chat, from.idStr)) return
+        val text = (msg.content as? TextedContent)?.text?.takeIf { it.isNotBlank() } ?: return
+        // Commands and permission verdicts are acted on once, when sent — an edit doesn't replay them.
+        if (text.startsWith("/") || PERMISSION_REPLY_RE.matches(text)) return
+        val thread = msg.topicThreadId
+        emitEvent(msg.chatIdStr, thread, text, from, mapOf(
+            "event" to "edit",
+            "message_id" to msg.idLong.toString(),
+        ))
     }
 
     // ── Inbound messages, batched ────────────────────────────────────────────

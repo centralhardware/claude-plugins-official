@@ -26,6 +26,8 @@ val INSTRUCTIONS = listOf(
     "",
     "A guest=\"true\" attribute means you were summoned by @mention into a chat the bot is not a member of (guest_chat_title names it). You see only that message, never the chat history or its members, and Telegram allows exactly one message back: pass the guest: chat_id to reply once, and use edit_message (or a further reply, which edits) to revise it. Attachments and reactions are unavailable there, and the answer stands in someone else's chat — keep it self-contained and say nothing you would not post publicly.",
     "",
+    "Some notifications are events on earlier messages rather than new ones; an event attribute says which. event=\"button\": the user tapped an inline button you sent with reply's buttons — button is the label, reply_to_text the question. event=\"poll_answer\": a vote on a poll from send_poll — chosen lists the picked options (empty = vote retracted). event=\"reaction\": the user put the reaction on message_id — usually a lightweight acknowledgement; answer only if it changes something (👎 on your reply means it was wrong). event=\"edit\": the user edited message message_id; the content is the new full text — treat it as a correction of that message and redo only what the change affects.",
+    "",
     "reply accepts file paths (files: [\"/abs/path.png\"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don't trigger push notifications — when a long task completes, send a new reply so the user's device pings.",
     "",
     "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
@@ -115,7 +117,7 @@ private suspend fun notifyOwners(text: String) {
     }
 }
 
-private val ALLOWED_UPDATES = listOf("message", "callback_query", "guest_message")
+private val ALLOWED_UPDATES = listOf("message", "edited_message", "callback_query", "poll_answer", "message_reaction", "guest_message")
 
 private suspend fun pollLoop(inbound: Inbound, miniApp: MiniApp) {
     if (!acquirePollerLock()) return
