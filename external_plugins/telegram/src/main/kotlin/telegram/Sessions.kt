@@ -254,12 +254,13 @@ object Sessions {
     /** A short summary via headless `claude -p`; Result.failure carries a reason for the user. */
     suspend fun summarize(f: File): Result<String> = withContext(Dispatchers.IO) {
         val text = dialogue(f).ifBlank { return@withContext Result.failure(Exception("empty transcript")) }
-        val prompt = "Summarize this Claude Code session for its owner, in English, at most ~12 lines, formatted as Telegram HTML: " +
-            "only <b>, <i>, <code>, <a href> and <blockquote> tags, • for bullets, short <b> labels to structure it, escape & < > in plain text, no markdown. " +
-            "what the session was about and what it achieved — its meaning and outcome, not a play-by-play of who said what " +
-            "(no thread ids, message mechanics or Telegram details) — plus key decisions/PRs and anything left open. Output only the summary: " +
-            "no heading or preamble, no English corrections or other footers, and skip any part that is empty instead of saying " +
-            "nothing happened there. The transcript follows on stdin."
+        val prompt = "Summarize this Claude Code session for its owner. English, addressed to them as \"you\", formatted as Telegram HTML " +
+            "(only <b>, <i>, <code>, <a href>, <blockquote expandable>; • for bullets; escape & < > in plain text; no markdown). Structure: " +
+            "one or two sentences on what the session was about and what came of it — its meaning, not a play-by-play, no thread ids or Telegram details; " +
+            "then <b>Needs you</b>: decisions or approvals still waiting on the owner, each one line, most important first; " +
+            "then <b>Done</b>: at most 5 one-line bullets of outcomes (PRs/commits as links when the transcript has the URL), " +
+            "with any finer detail folded into one <blockquote expandable>. Skip a section that would be empty. Never include secret values. " +
+            "Output only the summary: no heading, preamble, English corrections or footers. The transcript follows on stdin."
         try {
             val cmd = (Config.env("TELEGRAM_SUMMARY_CMD") ?: "claude -p --model sonnet").split(Regex("\\s+")) + prompt
             val pb = ProcessBuilder(cmd).directory(File(System.getProperty("user.home")))
