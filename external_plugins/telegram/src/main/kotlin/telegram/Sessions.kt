@@ -260,12 +260,12 @@ object Sessions {
         val text = dialogue(f).ifBlank { return@withContext Result.failure(Exception("empty transcript")) }
         val prompt = "Summarize this Claude Code session for its owner. English, addressed to them as \"you\", formatted as Telegram HTML " +
             "(only <b>, <i>, <code>, <a href>, <blockquote expandable>; • for bullets; escape & < > in plain text; no markdown). Exact order: " +
-            "1) first line: why the session was started — the owner's motivation or problem — and the outcome it led to, in one or two sentences " +
-            "(meaning, not a play-by-play; no thread ids or Telegram details); " +
-            "2) <b>Needs you</b>: decisions, approvals or actions still waiting on the owner, one line each, most important first (omit if none); " +
+            "1) <b>Why</b>: the owner's motivation or problem that started the session, one or two sentences; " +
+            "2) <b>Outcome</b>: what it led to, one or two sentences (meaning, not a play-by-play; no thread ids or Telegram details); " +
             "3) <b>Done</b>: at most 5 one-line outcome bullets; every PR, release or commit mentioned must be an <a href> link, " +
             "using the URLs from the transcript or the [links seen in tool output] list; " +
-            "4) everything else (numbers, caveats, side notes) goes inside ONE <blockquote expandable> at the end — no loose paragraphs after Done. " +
+            "4) everything else (numbers, caveats, side notes) inside ONE <blockquote expandable>; " +
+            "5) last, <b>Needs you</b>: decisions, approvals or actions still waiting on the owner, one line each, most important first (omit if none). " +
             "Never include secret values. Output only the summary: no heading, preamble, English corrections or footers. The transcript follows on stdin."
         try {
             val cmd = (Config.env("TELEGRAM_SUMMARY_CMD") ?: "claude -p --model sonnet").split(Regex("\\s+")) + prompt
