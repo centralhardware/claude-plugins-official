@@ -260,8 +260,9 @@ object Sessions {
         val text = dialogue(f).ifBlank { return@withContext Result.failure(Exception("empty transcript")) }
         val prompt = "Summarize this Claude Code session for its owner. English, addressed to them as \"you\", formatted as Telegram HTML " +
             "(only <b>, <i>, <code>, <a href>, <blockquote expandable>; • for bullets; escape & < > in plain text; no markdown). Exact order: " +
-            "1) <b>Needs you</b>: decisions, approvals or actions still waiting on the owner, one line each, most important first (omit if none); " +
-            "2) one or two sentences on what the session was about and what came of it — its meaning, not a play-by-play, no thread ids or Telegram details; " +
+            "1) first line: why the session was started — the owner's motivation or problem — and the outcome it led to, in one or two sentences " +
+            "(meaning, not a play-by-play; no thread ids or Telegram details); " +
+            "2) <b>Needs you</b>: decisions, approvals or actions still waiting on the owner, one line each, most important first (omit if none); " +
             "3) <b>Done</b>: at most 5 one-line outcome bullets; every PR, release or commit mentioned must be an <a href> link, " +
             "using the URLs from the transcript or the [links seen in tool output] list; " +
             "4) everything else (numbers, caveats, side notes) goes inside ONE <blockquote expandable> at the end — no loose paragraphs after Done. " +
