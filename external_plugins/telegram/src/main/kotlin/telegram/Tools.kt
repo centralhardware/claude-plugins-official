@@ -6,6 +6,7 @@ import dev.inmo.tgbotapi.extensions.api.get.getFileAdditionalInfo
 import dev.inmo.tgbotapi.extensions.api.send.media.sendDocument
 import dev.inmo.tgbotapi.extensions.api.send.media.sendPhoto
 import dev.inmo.tgbotapi.extensions.api.send.sendMessage
+import dev.inmo.tgbotapi.extensions.api.forwardMessage
 import dev.inmo.tgbotapi.extensions.api.send.sendRichMessage
 import dev.inmo.tgbotapi.extensions.api.send.setMessageReaction
 import dev.inmo.tgbotapi.requests.abstracts.InputFile
@@ -199,6 +200,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                     "chat_id" to json("type" to "string"),
                     "name" to json("type" to "string", "description" to "Session/topic name: 1–32 chars, a-z 0-9 - _ (e.g. visa-run)."),
                     "message" to json("type" to "string", "description" to "The user's opening message, verbatim, delivered to the new session as its first turn."),
+                    "message_id" to json("type" to "string", "description" to "message_id of the inbound Main message. Pass it: the original is forwarded natively into the topic instead of being re-posted as text."),
                     "image_path" to json("type" to "string", "description" to "Optional: image_path from the inbound message, passed through."),
                     "attachment_file_id" to json("type" to "string", "description" to "Optional: attachment_file_id from the inbound message, passed through."),
                 ),
@@ -219,6 +221,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                     "chat_id" to json("type" to "string"),
                     "name" to json("type" to "string", "description" to "Side session name (from list_sessions)."),
                     "message" to json("type" to "string", "description" to "The user's message, verbatim."),
+                    "message_id" to json("type" to "string", "description" to "message_id of the inbound Main message. Pass it: the original is forwarded natively into the topic instead of being re-posted as text."),
                     "image_path" to json("type" to "string"),
                     "attachment_file_id" to json("type" to "string"),
                 ),
@@ -241,13 +244,22 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         Sessions.enqueue(s, "notifications/claude/channel", buildJsonObject { put("content", message); put("meta", meta) })
     }
 
+    /** Native Telegram forward of the Main message into the session's topic; false if no message_id or it failed. */
+    private suspend fun forwardOriginal(chatId: String, s: NamedSession, args: JsonObject): Boolean {
+        val id = args.anyStr("message_id")?.toLongOrNull() ?: return false
+        return runCatching {
+            Tg.bot.forwardMessage(chatIdOf(chatId), chatIdOf(chatId), msgIdOf(id), threadId = threadOf(s.threadId))
+        }.isSuccess
+    }
+
     private suspend fun forwardToSession(args: JsonObject): JsonObject {
         val chatId = args.anyStr("chat_id") ?: throw IllegalArgumentException("chat_id required")
         val name = (args.anyStr("name") ?: throw IllegalArgumentException("name required")).lowercase()
         val message = args.anyStr("message") ?: throw IllegalArgumentException("message required")
         val s = Sessions.byName(name)?.takeIf { Sessions.alive(it) }
             ?: return text("no live side session \"$name\"; running: ${Sessions.load().filter { Sessions.alive(it) }.joinToString { it.name }.ifEmpty { "none" }}", error = true)
-        Tg.bot.sendMessage(chatIdOf(chatId), "↪️ Moved from Main:\n$message".take(MAX_CHUNK_LIMIT), threadId = threadOf(s.threadId))
+        if (!forwardOriginal(chatId, s, args))
+            Tg.bot.sendMessage(chatIdOf(chatId), "↪️ Moved from Main:\n$message".take(MAX_CHUNK_LIMIT), threadId = threadOf(s.threadId))
         handOff(s, chatId, message, args)
         return text("forwarded to session ${s.name}")
     }
@@ -258,6 +270,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         val message = args.anyStr("message") ?: throw IllegalArgumentException("message required")
         val s = Sessions.spawn(scope, name, chatId).getOrElse { return text("spawn_session failed: ${it.message}", error = true) }
         Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" started for this subject. Messages in this topic go to it; /nsend here stops it.", threadId = threadOf(s.threadId))
+        forwardOriginal(chatId, s, args)
         // Spooled now; the child drains it once its own server is up (startup grace covers the prompts).
         handOff(s, chatId, message, args)
         return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it")
