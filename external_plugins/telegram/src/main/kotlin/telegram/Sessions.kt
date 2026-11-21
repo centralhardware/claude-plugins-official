@@ -148,6 +148,10 @@ object Sessions {
     /** A startup dialog (dev channels, trust) waiting for a choice. */
     private fun isDialog(pane: String) = pane.contains("Enter to confirm")
 
+    /** The folder-trust dialog; its default (Enter) is "Yes, I trust this folder". */
+    private fun isTrustDialog(pane: String) =
+        Regex("trust this folder|Yes, I trust|Do you trust", RegexOption.IGNORE_CASE).containsMatchIn(pane)
+
     /** The input box is up and no dialog covers it: Claude Code can take a message. */
     fun isReady(pane: String): Boolean {
         if (isDialog(pane)) return false
@@ -172,7 +176,13 @@ object Sessions {
             val pane = paneText(target)
             when {
                 pane != null && isReady(pane) -> return
-                pane != null && isDialog(pane) && pane != lastAnswered -> { answer(); lastAnswered = pane }
+                // Answer by what the dialog is, not by its position: the trust prompt
+                // doesn't always come second, and "Down Enter" on it picks "No, exit".
+                pane != null && isDialog(pane) && pane != lastAnswered -> {
+                    if (isTrustDialog(pane)) { tmux("send-keys", "-t", target, "Enter"); lastAction = System.currentTimeMillis() }
+                    else answer()
+                    lastAnswered = pane
+                }
                 // Unrecognised screen: keep the old blind 8 s cadence as the floor.
                 System.currentTimeMillis() - lastAction >= 8000 -> answer()
             }
