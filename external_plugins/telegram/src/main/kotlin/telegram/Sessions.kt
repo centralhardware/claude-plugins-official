@@ -148,7 +148,7 @@ object Sessions {
     /** A startup dialog (dev channels, trust) waiting for a choice. */
     private fun isDialog(pane: String) = pane.contains("Enter to confirm")
 
-    /** The folder-trust dialog; option 1 is "Yes, I trust this folder". */
+    /** The folder-trust dialog: "No, exit" is listed first, "Yes, I trust this folder" second. */
     private fun isTrustDialog(pane: String) =
         Regex("trust this folder|Yes, I trust|Do you trust", RegexOption.IGNORE_CASE).containsMatchIn(pane)
 
@@ -179,9 +179,12 @@ object Sessions {
                 // Answer by what the dialog is, not by its position: the trust prompt
                 // doesn't always come second, and a blind "Down Enter" picks "Exit" on either.
                 pane != null && isDialog(pane) && pane != lastAnswered -> {
-                    // Both dialogs accept on option 1; Up first parks the cursor there whatever its start.
+                    // Park the cursor on the accepting option whatever its start: it is
+                    // last in the trust dialog ("No, exit" / "Yes, I trust") and first in
+                    // the dev-channels one ("I am using this…" / "Exit").
                     val keys = when {
-                        isTrustDialog(pane) || pane.contains("I am using this for local development") -> listOf("Up", "Up", "Enter")
+                        isTrustDialog(pane) -> listOf("Down", "Down", "Enter")
+                        pane.contains("I am using this for local development") -> listOf("Up", "Up", "Enter")
                         else -> null
                     }
                     if (keys != null) { tmux("send-keys", "-t", target, *keys.toTypedArray()); lastAction = System.currentTimeMillis() }
