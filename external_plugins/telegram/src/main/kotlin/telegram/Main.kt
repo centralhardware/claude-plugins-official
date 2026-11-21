@@ -203,7 +203,7 @@ fun main() {
     val typing = Typing(scope)
     lateinit var mcp: McpServer
     val inbound = Inbound(scope, { mcp }, typing)
-    val tools = Tools(typing)
+    val tools = Tools(typing, scope)
     mcp = McpServer(
         name = "telegram",
         version = "1.0.0",
