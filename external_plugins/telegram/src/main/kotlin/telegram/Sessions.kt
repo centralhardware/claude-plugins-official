@@ -254,7 +254,8 @@ object Sessions {
     /** A short summary via headless `claude -p`; Result.failure carries a reason for the user. */
     suspend fun summarize(f: File): Result<String> = withContext(Dispatchers.IO) {
         val text = dialogue(f).ifBlank { return@withContext Result.failure(Exception("empty transcript")) }
-        val prompt = "Summarize this Claude Code session for its owner, in English, plain text (no markdown), at most ~12 lines: " +
+        val prompt = "Summarize this Claude Code session for its owner, in English, at most ~12 lines, formatted as Telegram HTML: " +
+            "only <b>, <i>, <code>, <a href> and <blockquote> tags, • for bullets, short <b> labels to structure it, escape & < > in plain text, no markdown. " +
             "what the session was about and what it achieved — its meaning and outcome, not a play-by-play of who said what " +
             "(no thread ids, message mechanics or Telegram details) — plus key decisions/PRs and anything left open. Output only the summary: " +
             "no heading or preamble, no English corrections or other footers, and skip any part that is empty instead of saying " +
