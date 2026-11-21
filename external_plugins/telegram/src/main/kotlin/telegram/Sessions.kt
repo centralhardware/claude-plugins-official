@@ -227,8 +227,10 @@ object Sessions {
             .maxByOrNull { it["startedAt"]?.jsonPrimitive?.longOrNull ?: 0 }
         val id = meta?.get("sessionId")?.jsonPrimitive?.contentOrNull
         val cwd = meta?.get("cwd")?.jsonPrimitive?.contentOrNull
-        if (id == null || cwd == null) null
-        else File(configDir, "projects/${cwd.replace(Regex("[^A-Za-z0-9]"), "-")}/$id.jsonl").takeIf { it.isFile }
+        if (id == null || cwd == null) { log("transcript: no sessions/*.json with tmux ${s.tmux}"); null }
+        else File(configDir, "projects/${cwd.replace(Regex("[^A-Za-z0-9]"), "-")}/$id.jsonl").let { f ->
+            if (f.isFile) f else { log("transcript: ${f.path} missing"); null }
+        }
     } catch (e: Exception) { log("transcript lookup failed: ${e.describe()}"); null }
 
     /** User and assistant prose from a transcript, tool traffic dropped, newest kept. */
@@ -249,21 +251,24 @@ object Sessions {
         return parts.joinToString("\n\n").takeLast(maxChars)
     }
 
-    /** A short summary via headless `claude -p`, or null on failure/timeout. */
-    suspend fun summarize(f: File): String? = withContext(Dispatchers.IO) {
-        val text = dialogue(f).ifBlank { return@withContext null }
+    /** A short summary via headless `claude -p`; Result.failure carries a reason for the user. */
+    suspend fun summarize(f: File): Result<String> = withContext(Dispatchers.IO) {
+        val text = dialogue(f).ifBlank { return@withContext Result.failure(Exception("empty transcript")) }
         val prompt = "Summarize this Claude Code session for its owner, in English, plain text (no markdown), at most ~12 lines: " +
             "what was asked, what was done or decided (PRs, files, commands), and anything left open. The transcript follows on stdin."
         try {
             val cmd = (Config.env("TELEGRAM_SUMMARY_CMD") ?: "claude -p --model sonnet").split(Regex("\\s+")) + prompt
-            val pb = ProcessBuilder(cmd).redirectError(ProcessBuilder.Redirect.DISCARD)
+            val pb = ProcessBuilder(cmd).directory(File(System.getProperty("user.home")))
             pb.environment().remove("TELEGRAM_SESSION_NAME")
             val p = pb.start()
             p.outputStream.bufferedWriter().use { it.write(text) }
             val out = async { p.inputStream.bufferedReader().readText() }
-            if (!p.waitFor(5, java.util.concurrent.TimeUnit.MINUTES)) { p.destroyForcibly(); log("summary timed out"); return@withContext null }
-            out.await().trim().takeIf { p.exitValue() == 0 && it.isNotEmpty() }
-        } catch (e: Exception) { log("summary failed: ${e.describe()}"); null }
+            val err = async { p.errorStream.bufferedReader().readText() }
+            if (!p.waitFor(5, java.util.concurrent.TimeUnit.MINUTES)) { p.destroyForcibly(); return@withContext Result.failure(Exception("timed out")) }
+            val o = out.await().trim()
+            if (p.exitValue() == 0 && o.isNotEmpty()) Result.success(o)
+            else Result.failure(Exception("exit ${p.exitValue()}: ${(err.await().trim().ifEmpty { o }).takeLast(300)}"))
+        } catch (e: Exception) { Result.failure(Exception(e.describe())) }.onFailure { log("summary failed: ${it.message}") }
     }
 
     /** Thread of the topic named "Main" in telegram-topics.json, if any. */

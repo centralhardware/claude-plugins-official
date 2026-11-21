@@ -297,10 +297,11 @@ class Inbound(
                 val transcript = Sessions.transcriptOf(s)
                 Sessions.end(s)
                 // The topic is about to vanish: leave a summary of the session in Main.
-                if (transcript != null) scope.launch {
-                    val summary = Sessions.summarize(transcript) ?: return@launch
+                scope.launch {
+                    val body = if (transcript == null) "⚠️ no summary: transcript not found"
+                        else Sessions.summarize(transcript).fold({ it }, { "⚠️ no summary: ${it.message}" })
                     try {
-                        Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped):\n\n$summary".take(4096),
+                        Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped):\n\n$body".take(4096),
                             threadId = threadOf(Sessions.mainThread(s.chatId)))
                     } catch (e: Exception) { log("summary post failed: ${e.describe()}") }
                 }
