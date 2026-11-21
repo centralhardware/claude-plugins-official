@@ -294,7 +294,16 @@ class Inbound(
             "nsdrop" -> {
                 val s = (if (arg.isNotEmpty()) Sessions.byName(arg.lowercase()) else side)
                     ?: return say("Not a session topic. Usage: /nsdrop <name>, or /nsdrop inside its topic.").let { true }
+                val transcript = Sessions.transcriptOf(s)
                 Sessions.end(s)
+                // The topic is about to vanish: leave a summary of the session in Main.
+                if (transcript != null) scope.launch {
+                    val summary = Sessions.summarize(transcript) ?: return@launch
+                    try {
+                        Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped):\n\n$summary".take(4096),
+                            threadId = threadOf(Sessions.mainThread(s.chatId)))
+                    } catch (e: Exception) { log("summary post failed: ${e.describe()}") }
+                }
                 val deleted = try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
                     catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
                 // Inside the dropped topic there's nowhere left to answer.

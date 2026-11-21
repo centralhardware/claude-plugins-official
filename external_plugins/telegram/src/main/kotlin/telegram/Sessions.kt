@@ -210,4 +210,66 @@ object Sessions {
     }
 
     fun interrupt(s: NamedSession) = tmux("send-keys", "-t", s.tmux, "Escape")
+
+    // ── Summary on /nsdrop ───────────────────────────────────────────────────
+
+    private val configDir get() = File(System.getenv("CLAUDE_CONFIG_DIR") ?: "${System.getProperty("user.home")}/.claude")
+
+    /**
+     * The side session's transcript: Claude Code's sessions/<pid>.json records the
+     * tmux pane and session id, the transcript is projects/<cwd>/<id>.jsonl. Must be
+     * read before [end] — the pid file goes away with the process.
+     */
+    fun transcriptOf(s: NamedSession): File? = try {
+        val meta = File(configDir, "sessions").listFiles { f -> f.name.endsWith(".json") }.orEmpty()
+            .mapNotNull { f -> try { Json.parseToJsonElement(f.readText()).jsonObject } catch (_: Exception) { null } }
+            .filter { it["tmux"]?.jsonPrimitive?.contentOrNull?.startsWith("${s.tmux}:") == true }
+            .maxByOrNull { it["startedAt"]?.jsonPrimitive?.longOrNull ?: 0 }
+        val id = meta?.get("sessionId")?.jsonPrimitive?.contentOrNull
+        val cwd = meta?.get("cwd")?.jsonPrimitive?.contentOrNull
+        if (id == null || cwd == null) null
+        else File(configDir, "projects/${cwd.replace(Regex("[^A-Za-z0-9]"), "-")}/$id.jsonl").takeIf { it.isFile }
+    } catch (e: Exception) { log("transcript lookup failed: ${e.describe()}"); null }
+
+    /** User and assistant prose from a transcript, tool traffic dropped, newest kept. */
+    private fun dialogue(f: File, maxChars: Int = 60_000): String {
+        val parts = f.readLines().mapNotNull { line ->
+            val o = try { Json.parseToJsonElement(line).jsonObject } catch (_: Exception) { return@mapNotNull null }
+            val role = o["type"]?.jsonPrimitive?.contentOrNull?.takeIf { it == "user" || it == "assistant" } ?: return@mapNotNull null
+            val content = (o["message"] as? JsonObject)?.get("content") ?: return@mapNotNull null
+            val text = when (content) {
+                is JsonPrimitive -> content.contentOrNull
+                is JsonArray -> content.mapNotNull { b ->
+                    (b as? JsonObject)?.takeIf { it["type"]?.jsonPrimitive?.contentOrNull == "text" }?.get("text")?.jsonPrimitive?.contentOrNull
+                }.joinToString("\n")
+                else -> null
+            }?.trim()
+            if (text.isNullOrEmpty() || text.startsWith("<system-reminder>")) null else "[$role] $text"
+        }
+        return parts.joinToString("\n\n").takeLast(maxChars)
+    }
+
+    /** A short summary via headless `claude -p`, or null on failure/timeout. */
+    suspend fun summarize(f: File): String? = withContext(Dispatchers.IO) {
+        val text = dialogue(f).ifBlank { return@withContext null }
+        val prompt = "Summarize this Claude Code session for its owner, in English, plain text (no markdown), at most ~12 lines: " +
+            "what was asked, what was done or decided (PRs, files, commands), and anything left open. The transcript follows on stdin."
+        try {
+            val cmd = (Config.env("TELEGRAM_SUMMARY_CMD") ?: "claude -p --model sonnet").split(Regex("\\s+")) + prompt
+            val pb = ProcessBuilder(cmd).redirectError(ProcessBuilder.Redirect.DISCARD)
+            pb.environment().remove("TELEGRAM_SESSION_NAME")
+            val p = pb.start()
+            p.outputStream.bufferedWriter().use { it.write(text) }
+            val out = async { p.inputStream.bufferedReader().readText() }
+            if (!p.waitFor(5, java.util.concurrent.TimeUnit.MINUTES)) { p.destroyForcibly(); log("summary timed out"); return@withContext null }
+            out.await().trim().takeIf { p.exitValue() == 0 && it.isNotEmpty() }
+        } catch (e: Exception) { log("summary failed: ${e.describe()}"); null }
+    }
+
+    /** Thread of the topic named "Main" in telegram-topics.json, if any. */
+    fun mainThread(chatId: String): Long? = try {
+        Json.parseToJsonElement(Config.topicsFile.readText()).jsonObject.entries.firstOrNull { (k, v) ->
+            k.startsWith("$chatId:") && (v as? JsonObject)?.get("name")?.jsonPrimitive?.contentOrNull == "Main"
+        }?.key?.substringAfter(':')?.toLongOrNull()
+    } catch (_: Exception) { null }
 }
