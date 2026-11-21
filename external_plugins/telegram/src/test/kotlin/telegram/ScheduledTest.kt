@@ -10,8 +10,8 @@ class ScheduledTest {
     @Test fun inMinutes() = assertEquals(now + 90_000, Scheduled.parseWhen(null, 1.5, now))
 
     @Test fun isoWithOffset() =
-        assertEquals(java.time.OffsetDateTime.parse("2027-01-15T08:00:00+07:00").toInstant().toEpochMilli(),
-            Scheduled.parseWhen("2027-01-15T08:00:00+07:00", null, now))
+        assertEquals(java.time.OffsetDateTime.parse("2027-02-01T08:00:00+07:00").toInstant().toEpochMilli(),
+            Scheduled.parseWhen("2027-02-01T08:00:00+07:00", null, now))
 
     @Test fun epochSeconds() = assertEquals((now / 1000 + 60) * 1000, Scheduled.parseWhen("${now / 1000 + 60}", null, now))
 
