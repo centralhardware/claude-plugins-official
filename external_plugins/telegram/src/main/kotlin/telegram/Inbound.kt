@@ -27,6 +27,7 @@ import dev.inmo.tgbotapi.types.queries.callback.DataCallbackQuery
 import dev.inmo.tgbotapi.types.queries.callback.MessageCallbackQuery
 import dev.inmo.tgbotapi.types.reactions.Reaction
 import dev.inmo.tgbotapi.types.MessageThreadId
+import dev.inmo.tgbotapi.types.message.HTMLParseMode
 import dev.inmo.tgbotapi.extensions.api.chat.forum.deleteForumTopic
 import dev.inmo.tgbotapi.types.update.CallbackQueryUpdate
 import dev.inmo.tgbotapi.types.update.ChatMessageReactionUpdatedUpdate
@@ -299,11 +300,18 @@ class Inbound(
                 // The topic is about to vanish: leave a summary of the session in Main.
                 scope.launch {
                     val body = if (transcript == null) "⚠️ no summary: transcript not found"
-                        else Sessions.summarize(transcript).fold({ it }, { "⚠️ no summary: ${it.message}" })
+                        else Sessions.summarize(transcript).fold({ it }, { "⚠️ no summary: " + (it.message ?: "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") })
+                    val thread = threadOf(Sessions.mainThread(s.chatId))
+                    val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
                     try {
-                        Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped):\n\n$body".take(4096),
-                            threadId = threadOf(Sessions.mainThread(s.chatId)))
-                    } catch (e: Exception) { log("summary post failed: ${e.describe()}") }
+                        Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (dropped)\n\n$body".take(4096),
+                            parseMode = HTMLParseMode, threadId = thread)
+                    } catch (e: Exception) {
+                        // Model-written HTML can be malformed: fall back to the raw text.
+                        log("summary HTML rejected, sending plain: ${e.describe()}")
+                        try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped)\n\n$body".take(4096), threadId = thread) }
+                        catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
+                    }
                 }
                 val deleted = try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
                     catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
