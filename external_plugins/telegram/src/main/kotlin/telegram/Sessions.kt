@@ -255,7 +255,8 @@ object Sessions {
     suspend fun summarize(f: File): Result<String> = withContext(Dispatchers.IO) {
         val text = dialogue(f).ifBlank { return@withContext Result.failure(Exception("empty transcript")) }
         val prompt = "Summarize this Claude Code session for its owner, in English, plain text (no markdown), at most ~12 lines: " +
-            "what was asked, what was done or decided (PRs, files, commands), and anything left open. Output only the summary: " +
+            "what the session was about and what it achieved — its meaning and outcome, not a play-by-play of who said what " +
+            "(no thread ids, message mechanics or Telegram details) — plus key decisions/PRs and anything left open. Output only the summary: " +
             "no heading or preamble, no English corrections or other footers, and skip any part that is empty instead of saying " +
             "nothing happened there. The transcript follows on stdin."
         try {
