@@ -261,7 +261,16 @@ fun main() {
             // silently — and drain() deletes the file. The first message typed into a
             // fresh topic always lands in that window.
             mcp.initialized.await()
-            delay(Sessions.startupGraceMs)
+            // Wait for the input box on our own pane; the old fixed grace is the ceiling.
+            val tmuxName = System.getenv("CLAUDE_TMUX_SESSION")
+            val deadline = System.currentTimeMillis() + Sessions.startupGraceMs
+            while (System.currentTimeMillis() < deadline) {
+                val pane = tmuxName?.let { Sessions.paneText(it) } ?: break
+                if (Sessions.isReady(pane)) { delay(500); break }
+                delay(300)
+            }
+            if (tmuxName == null || System.currentTimeMillis() >= deadline)
+                delay((deadline - System.currentTimeMillis()).coerceAtLeast(0))
             log("side session \"$side\" — ready, draining the spool")
             Sessions.drain(side) { method, params ->
                 if (method == "notifications/claude/channel") {

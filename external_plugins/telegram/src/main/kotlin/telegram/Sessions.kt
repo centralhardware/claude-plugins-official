@@ -131,13 +131,53 @@ object Sessions {
         // The shell outlives claude, so a crash leaves the pane readable instead of vanishing.
         val cmd = "env $env $launchCmd; exec \$SHELL"
         check(tmux("new-session", "-d", "-s", s.tmux, "-c", home, cmd)) { "tmux new-session failed." }
-        scope.launch {
-            for (keys in promptKeys) {
-                delay(8000)
-                tmux("send-keys", "-t", s.tmux, *keys.toTypedArray())
-            }
-        }
+        scope.launch { answerPrompts(s.tmux) }
         s
+    }
+
+    // ── Startup screen ───────────────────────────────────────────────────────
+
+    /** The visible pane text, or null when tmux can't be read. */
+    fun paneText(target: String): String? = try {
+        val p = ProcessBuilder("tmux", "capture-pane", "-p", "-t", target).redirectErrorStream(true)
+            .redirectInput(ProcessBuilder.Redirect.from(File("/dev/null"))).start()
+        val out = p.inputStream.bufferedReader().readText()
+        if (p.waitFor() == 0) out else null
+    } catch (e: Exception) { null }
+
+    /** A startup dialog (dev channels, trust) waiting for a choice. */
+    private fun isDialog(pane: String) = pane.contains("Enter to confirm")
+
+    /** The input box is up and no dialog covers it: Claude Code can take a message. */
+    fun isReady(pane: String): Boolean {
+        if (isDialog(pane)) return false
+        // The prompt line sits between two full-width rules; a dialog's "❯ 1. Yes" cursor doesn't.
+        val l = pane.lines().map { it.trimStart() }
+        return l.indices.any { i ->
+            l[i].startsWith("❯") && l.getOrNull(i - 1)?.startsWith("───") == true && l.getOrNull(i + 1)?.startsWith("───") == true
+        }
+    }
+
+    /**
+     * Answers each startup dialog the moment it is on screen instead of after a
+     * fixed 8 s, falling back to the old blind timing if the pane can't be read.
+     */
+    private suspend fun answerPrompts(target: String) {
+        val deadline = System.currentTimeMillis() + startupGraceMs
+        var next = 0
+        var lastAnswered: String? = null
+        var lastAction = System.currentTimeMillis()
+        fun answer() { tmux("send-keys", "-t", target, *promptKeys[next++].toTypedArray()); lastAction = System.currentTimeMillis() }
+        while (next < promptKeys.size && System.currentTimeMillis() < deadline) {
+            val pane = paneText(target)
+            when {
+                pane != null && isReady(pane) -> return
+                pane != null && isDialog(pane) && pane != lastAnswered -> { answer(); lastAnswered = pane }
+                // Unrecognised screen: keep the old blind 8 s cadence as the floor.
+                System.currentTimeMillis() - lastAction >= 8000 -> answer()
+            }
+            delay(300)
+        }
     }
 
     fun remove(name: String) {
