@@ -209,6 +209,41 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                 "required" to listOf("summary"),
             ),
         ))
+        // Session network: a coordinator (Main or a topic session, never a worker) splits a task across workers.
+        if (Sessions.self()?.parent == null) add(json(
+            "name" to "spawn_worker",
+            "description" to "Session network: start a worker — a separate Claude session in its own topic (🕸 name ← you) — and hand it one part of a " +
+                "complicated task. You coordinate: split the task, give each worker a self-contained brief (goal, inputs, constraints, what to report back, " +
+                "which peers it may need), then wait. Workers message you and each other with send_to_session; each one's final report arrives as an " +
+                "event=\"worker_done\" turn when it closes. Up to ${Sessions.MAX_WORKERS} workers; workers can't spawn workers. Closing you closes them.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json(
+                    "name" to json("type" to "string", "description" to "Worker name: 1–32 chars, a-z 0-9 - _ (e.g. research-api)."),
+                    "task" to json("type" to "string", "description" to "The worker's full brief; it knows nothing else."),
+                ),
+                "required" to listOf("name", "task"),
+            ),
+        ))
+        add(json(
+            "name" to "send_to_session",
+            "description" to "Session network: send a message to another member of your network — your coordinator, your workers, or sibling workers " +
+                "(\"${Sessions.MAIN}\" is the main session). It arrives there as a turn with from_session set; a copy is shown in its topic. " +
+                "Reply to an inbound from_session message with this tool, not with reply. Keep messages self-contained.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json(
+                    "to" to json("type" to "string", "description" to "Recipient session name (see list_sessions)."),
+                    "message" to json("type" to "string"),
+                ),
+                "required" to listOf("to", "message"),
+            ),
+        ))
+        if (Sessions.isChild) add(json(
+            "name" to "list_sessions",
+            "description" to "List your session network: coordinator, workers, siblings, and whether each is alive.",
+            "inputSchema" to json("type" to "object", "properties" to json()),
+        ))
         // Side sessions are spawned by the main session only; a child can't nest them.
         if (!Sessions.isChild) add(json(
             "name" to "spawn_session",
@@ -272,9 +307,52 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         ))
     }
 
-    private fun listSessions(): JsonObject = text(Sessions.load().joinToString("\n") {
-        "${it.name} thread=${it.threadId} ${if (Sessions.alive(it)) "alive" else "dead"}"
-    }.ifEmpty { "no side sessions" })
+    private fun listSessions(): JsonObject {
+        val all = if (Sessions.isChild) Sessions.peersOf(Sessions.selfId).mapNotNull { Sessions.byName(it) } else Sessions.load()
+        val rows = all.joinToString("\n") {
+            "${it.name} thread=${it.threadId} ${if (Sessions.alive(it)) "alive" else "dead"}${it.parent?.let { p -> " worker-of=$p" } ?: ""}"
+        }
+        val mainRow = if (Sessions.isChild && Sessions.MAIN in Sessions.peersOf(Sessions.selfId)) "${Sessions.MAIN} (main session)\n" else ""
+        return text((mainRow + rows).ifBlank { "no side sessions" })
+    }
+
+    private suspend fun spawnWorker(args: JsonObject): JsonObject {
+        val me = Sessions.selfId
+        val self = Sessions.self()
+        if (self?.parent != null) return text("workers can't spawn workers; ask your coordinator (${self.parent}) instead", error = true)
+        val name = (args.anyStr("name") ?: throw IllegalArgumentException("name required")).lowercase()
+        val task = args.anyStr("task")?.takeIf { it.isNotBlank() } ?: throw IllegalArgumentException("task required")
+        if (Sessions.workersOf(me).size >= Sessions.MAX_WORKERS) return text("already ${Sessions.MAX_WORKERS} workers; wait for one to finish", error = true)
+        val chatId = self?.chatId ?: lastThread.keys.firstOrNull() ?: AccessStore.load().allowFrom.firstOrNull()
+            ?: return text("no chat to open the worker's topic in", error = true)
+        val s = Sessions.spawn(scope, name, chatId, parent = me).getOrElse { return text("spawn_worker failed: ${it.message}", error = true) }
+        val peers = Sessions.peersOf(name).joinToString()
+        try {
+            Tg.bot.sendMessage(chatIdOf(chatId), "🕸 Worker \"${s.name}\" of \"$me\". Brief:\n\n$task".take(MAX_CHUNK_LIMIT), threadId = threadOf(s.threadId))
+        } catch (e: Exception) { log("worker brief post failed: ${e.describe()}") }
+        Sessions.deliverPeer(s.name, me, "You are worker \"${s.name}\" in a session network coordinated by \"$me\". Peers you can message with " +
+            "send_to_session: $peers. Work on the brief below; ask the coordinator or peers when blocked. When your part is done, call request_close " +
+            "with your final report as the summary — it goes to \"$me\", not to the user.\n\nBrief:\n$task", "task")
+        Sessions.watchCheckIn(scope, s)
+        return text("worker ${s.name} started (topic thread ${s.threadId}); its brief is queued. Its report arrives as event=\"worker_done\".")
+    }
+
+    private suspend fun sendToSession(args: JsonObject): JsonObject {
+        val me = Sessions.selfId
+        val to = (args.anyStr("to") ?: throw IllegalArgumentException("to required")).lowercase()
+        val message = args.anyStr("message")?.takeIf { it.isNotBlank() } ?: throw IllegalArgumentException("message required")
+        val peers = Sessions.peersOf(me)
+        if (to !in peers) return text("\"$to\" isn't in your network; peers: ${peers.joinToString().ifEmpty { "none" }}", error = true)
+        val target = Sessions.byName(to)
+        if (target != null && !Sessions.alive(target)) return text("\"$to\" isn't running", error = true)
+        Sessions.deliverPeer(to, me, message, "peer_message")
+        val chatId = target?.chatId ?: Sessions.byName(me)?.chatId
+        if (chatId != null) try {
+            Tg.bot.sendMessage(chatIdOf(chatId), "📨 $me → $to:\n${message.take(1500)}${if (message.length > 1500) "…" else ""}",
+                threadId = threadOf(target?.threadId ?: Sessions.mainThread(chatId)))
+        } catch (e: Exception) { log("peer message mirror failed: ${e.describe()}") }
+        return text("delivered to $to")
+    }
 
     private fun handOff(s: NamedSession, chatId: String, message: String, args: JsonObject) {
         val meta = buildJsonObject {
@@ -344,7 +422,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         Sessions.saveSummary(s.name, summary)
         // Explicit close: no buttons. The child drops itself (summary in Main, topic deleted, tmux killed last),
         // after a beat so this result reaches the model first.
-        if (args["now"]?.jsonPrimitive?.booleanOrNull == true) {
+        if (args["now"]?.jsonPrimitive?.booleanOrNull == true || s.parent != null) {
             scope.launch { delay(1500); Sessions.drop(scope, s) }
             return text("summary saved; this session is closing now")
         }
@@ -410,6 +488,8 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "send_poll" -> sendPoll(args)
             "spawn_session" -> spawnSession(args)
             "list_sessions" -> listSessions()
+            "spawn_worker" -> spawnWorker(args)
+            "send_to_session" -> sendToSession(args)
             "forward_to_session" -> forwardToSession(args)
             "request_close" -> requestClose(args)
             "restart_session" -> restartSession(args)

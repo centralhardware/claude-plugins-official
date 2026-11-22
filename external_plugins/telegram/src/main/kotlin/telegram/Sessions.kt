@@ -27,7 +27,11 @@ import java.nio.file.StandardCopyOption
  * Telegram, defaulting to its topic.
  */
 @Serializable
-data class NamedSession(val name: String, val chatId: String, val threadId: Long, val tmux: String, val createdAt: Long)
+data class NamedSession(
+    val name: String, val chatId: String, val threadId: Long, val tmux: String, val createdAt: Long,
+    /** Session network: the coordinator that spawned this worker ("main" for Main), null for an ordinary topic session. */
+    val parent: String? = null,
+)
 
 object Sessions {
     private val file get() = File(Config.stateDir, "sessions.json")
@@ -61,16 +65,54 @@ object Sessions {
 
     fun self(): NamedSession? = selfName?.let { byName(it) }
 
-    // ── Spool ────────────────────────────────────────────────────────────────
+    // ── Network ──────────────────────────────────────────────────────────────
 
-    /** Parent side: queue one MCP notification for the side session. */
-    fun enqueue(s: NamedSession, method: String, params: JsonObject) {
-        val dir = File(spoolRoot, s.name).apply { mkdirs() }
+    /** Name the main session goes by inside a network; its spool is sessions/main/. */
+    const val MAIN = "main"
+    const val MAX_WORKERS = 8
+
+    /** This server's identity in a network. */
+    val selfId: String get() = selfName ?: MAIN
+
+    fun workersOf(coordinator: String) = load().filter { it.parent == coordinator }
+
+    /** The coordinator a session's network hangs off: its parent if it's a worker, else itself. */
+    fun rootOf(id: String): String = byName(id)?.parent ?: id
+
+    /** Everyone [id] may message: its coordinator, its workers and its sibling workers. */
+    fun peersOf(id: String): List<String> {
+        val root = rootOf(id)
+        return (listOf(root) + workersOf(root).map { it.name }).distinct().filter { it != id }
+    }
+
+    /** Queue a notification for any network member, Main included. */
+    fun enqueueTo(id: String, method: String, params: JsonObject) {
+        val dir = File(spoolRoot, id).apply { mkdirs() }
         val base = "%020d-%d".format(System.nanoTime(), ProcessHandle.current().pid())
         val tmp = File(dir, "$base.tmp")
         tmp.writeText(buildJsonObject { put("method", method); put("params", params) }.toString())
         Files.move(tmp.toPath(), File(dir, "$base.json").toPath(), StandardCopyOption.ATOMIC_MOVE)
     }
+
+    /** Peer message as a channel turn: meta.from_session names the sender, event says what kind. */
+    fun deliverPeer(to: String, from: String, text: String, event: String) {
+        val target = byName(to)
+        val chatId = target?.chatId ?: byName(from)?.chatId ?: return
+        enqueueTo(to, "notifications/claude/channel", buildJsonObject {
+            put("content", text)
+            put("meta", buildJsonObject {
+                put("chat_id", chatId)
+                (target?.threadId ?: mainThread(chatId))?.let { put("thread_id", it.toString()) }
+                put("from_session", from); put("event", event)
+                put("ts", java.time.Instant.now().toString())
+            })
+        })
+    }
+
+    // ── Spool ────────────────────────────────────────────────────────────────
+
+    /** Parent side: queue one MCP notification for the side session. */
+    fun enqueue(s: NamedSession, method: String, params: JsonObject) = enqueueTo(s.name, method, params)
 
     /** Child side: hand every queued notification to [handle], oldest first, forever. */
     suspend fun drain(name: String, handle: suspend (String, JsonObject) -> Unit) {
@@ -120,11 +162,13 @@ object Sessions {
     val startupGraceMs get() = (promptKeys.size + 1) * 8000L
 
     /** Creates the topic, registers it, starts claude. Returns the session or an error text. */
-    suspend fun spawn(scope: CoroutineScope, name: String, chatId: String): Result<NamedSession> = runCatching {
+    suspend fun spawn(scope: CoroutineScope, name: String, chatId: String, parent: String? = null): Result<NamedSession> = runCatching {
         require(NAME_RE.matches(name)) { "Name must be 1–32 chars: a-z, 0-9, - or _." }
+        require(name != MAIN) { "\"$MAIN\" is reserved." }
         byName(name)?.let { if (alive(it)) error("Session \"$name\" already exists.") else remove(name) }
-        val topic = Tg.bot.createForumTopic(chatIdOf(chatId), "🤖 $name", dev.inmo.tgbotapi.types.ForumTopic.CYAN)
-        val s = NamedSession(name, chatId, topic.messageThreadId.long, "tg-$name", System.currentTimeMillis())
+        val title = if (parent != null) "🕸 $name ← $parent" else "🤖 $name"
+        val topic = Tg.bot.createForumTopic(chatIdOf(chatId), title.take(128), dev.inmo.tgbotapi.types.ForumTopic.CYAN)
+        val s = NamedSession(name, chatId, topic.messageThreadId.long, "tg-$name", System.currentTimeMillis(), parent)
         save(load().filter { it.name != name } + s)
         launch(scope, s)
         s
@@ -314,8 +358,13 @@ object Sessions {
     suspend fun drop(scope: CoroutineScope, s: NamedSession): Boolean {
         val body = try { summaryFile(s.name).readText().trim().ifEmpty { null } } catch (_: Exception) { null }
             ?: "⚠️ no summary: the session closed without writing one"
+        // A coordinator takes its workers down with it (they're no use without it).
+        for (w in workersOf(s.name)) { summaryFile(w.name).delete(); drop(scope, w) }
+        // A worker reports to its coordinator, as a turn there and in its topic — not in Main.
+        val parent = s.parent
+        if (parent != null) deliverPeer(parent, s.name, "Worker \"${s.name}\" finished and closed. Its report:\n\n$body", "worker_done")
         // Sequential, tmux killed last: a child closing itself runs inside that tmux.
-        val thread = threadOf(mainThread(s.chatId))
+        val thread = threadOf(parent?.let { byName(it)?.threadId } ?: mainThread(s.chatId))
         val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
         try {
             Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (closed)\n\n$body".take(4096),
