@@ -293,7 +293,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
         val fresh = Sessions.restart(scope, s).getOrElse { return text("restart_session failed: ${it.message}", error = true) }
         try { Tg.bot.sendMessage(chatIdOf(s.chatId), "🔄 Session \"${s.name}\" restarted.", threadId = threadOf(s.threadId)) } catch (_: Exception) {}
-        return text("restarted ${fresh.name}; you hear again only if it fails to come up (session_dead)")
+        return text("restarted ${fresh.name}; expect session_alive when it checks in, session_dead if it doesn't")
     }
 
     private suspend fun requestClose(args: JsonObject): JsonObject {
