@@ -251,6 +251,12 @@ fun main() {
         val miniApp = MiniApp(token)
         scope.launch { pollLoop(inbound, miniApp) }
         Scheduled.start(scope) { ownsPollerLock && !shuttingDown }
+        // Session network: workers and coordinators message Main through sessions/main/.
+        scope.launch {
+            mcp.initialized.await()
+            while (!ownsPollerLock) delay(1000)  // only the polling Main takes them, or a standby would eat them
+            Sessions.drain(Sessions.MAIN) { method, params -> mcp.notify(method, params) }
+        }
     } else {
         // Side session (spawn_session): the main server polls and spools this topic's traffic here.
         log("side session \"$side\" — not polling, reading the spool")
