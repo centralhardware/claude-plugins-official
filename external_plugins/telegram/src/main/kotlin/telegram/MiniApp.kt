@@ -8,6 +8,7 @@ import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.cio.*
 import io.ktor.server.engine.*
+import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.server.websocket.*
@@ -35,6 +36,10 @@ import kotlin.time.Duration.Companion.seconds
  * TELEGRAM_MINIAPP_HOST (default 0.0.0.0), TELEGRAM_MINIAPP_URL (public https
  * URL; when set, allowlisted DMs get a menu button opening it),
  * TELEGRAM_MINIAPP_HISTORY (scrollback lines, default 3000).
+ *
+ * In webhook mode (TELEGRAM_UPDATES=webhook) the same server also takes
+ * POST /telegram/update from tg-webhook-relay: a plain Telegram webhook call,
+ * authenticated by X-Telegram-Bot-Api-Secret-Token.
  */
 class MiniApp(token: String) {
     private val keeper = TelegramAPIUrlsKeeper(token)
@@ -45,7 +50,7 @@ class MiniApp(token: String) {
     private var server: EmbeddedServer<*, *>? = null
 
     /** Started only by the poller-lock holder, so instances never fight over the port. */
-    fun start() {
+    fun start(onUpdate: (suspend (String) -> Unit)? = null) {
         if (port <= 0 || server != null) return
         server = try {
             embeddedServer(CIO, port = port, host = host) {
@@ -55,6 +60,14 @@ class MiniApp(token: String) {
                     get("/app.js") { asset(call, "app.js", ContentType.Text.JavaScript) }
                     get("/app.css") { asset(call, "app.css", ContentType.Text.CSS) }
                     webSocket("/ws") { stream(this) }
+                    if (onUpdate != null) post("/telegram/update") {
+                        if (call.request.header("X-Telegram-Bot-Api-Secret-Token") != Webhook.secret) {
+                            call.respond(HttpStatusCode.Unauthorized); return@post
+                        }
+                        // A non-2xx makes the relay retry the same update, in order.
+                        try { onUpdate(call.receiveText()); call.respond(HttpStatusCode.OK) }
+                        catch (e: Exception) { log("webhook update rejected: ${e.describe()}"); call.respond(HttpStatusCode.BadRequest) }
+                    }
                 }
             }.start(wait = false)
         } catch (e: Exception) {

@@ -119,9 +119,30 @@ private suspend fun notifyOwners(text: String) {
 
 private val ALLOWED_UPDATES = listOf("message", "edited_message", "callback_query", "poll_answer", "message_reaction", "guest_message")
 
+/**
+ * Webhook mode: tg-webhook-relay receives Telegram's webhook and forwards each
+ * update to the mini app server's /telegram/update. The lock holder still owns
+ * the bot (server, commands, scheduled sends); it just doesn't call getUpdates.
+ * The shared secret is derived from the token on both sides.
+ */
+object Webhook {
+    val enabled get() = Config.env("TELEGRAM_UPDATES") == "webhook"
+    val secret: String by lazy {
+        java.security.MessageDigest.getInstance("SHA-256").digest("tg-webhook-relay:${Config.token}".toByteArray())
+            .joinToString("") { "%02x".format(it) }
+    }
+    private val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true; isLenient = true; explicitNulls = false }
+    fun parse(body: String) = json.decodeFromString(dev.inmo.tgbotapi.types.update.abstracts.UpdateDeserializationStrategy, body)
+}
+
 private suspend fun pollLoop(inbound: Inbound, miniApp: MiniApp) {
     if (!acquirePollerLock()) return
-    miniApp.start()
+    if (Webhook.enabled) {
+        miniApp.start { body ->
+            val u = Webhook.parse(body)
+            try { inbound.onUpdate(u) } catch (e: Exception) { log("handler error: ${e.describe()}") }
+        }
+    } else miniApp.start()
     var failures = 0
     var offset: Long? = null
     while (!shuttingDown) {
@@ -140,6 +161,12 @@ private suspend fun pollLoop(inbound: Inbound, miniApp: MiniApp) {
             try {
                 Tg.bot.setMyCommands(extraCommands().map { BotCommand(it.str("command")!!, it.str("description")!!) }, BotCommandScopeAllPrivateChats)
             } catch (_: Exception) {}
+
+            if (Webhook.enabled) {
+                log("webhook mode — updates arrive from tg-webhook-relay, not polling")
+                while (!shuttingDown) delay(HEARTBEAT_MS)
+                return
+            }
 
             while (!shuttingDown) {
                 // ktgbotapi sets the HTTP timeout to the long-poll timeout, so an
