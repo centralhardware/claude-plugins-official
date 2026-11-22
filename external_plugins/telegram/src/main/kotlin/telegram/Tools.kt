@@ -190,19 +190,21 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                 "required" to listOf("id"),
             ),
         ))
-        // The side session's own exit: it proposes, the user confirms with a button.
+        // The side session's own exit: it proposes and the user confirms with a button, unless the user already asked to close.
         if (Sessions.isChild) add(json(
             "name" to "request_close",
             "description" to "Close this side session once its subject is resolved or completed, or when an event=\"close_requested\" message asks you to. " +
                 "You write the session summary yourself; it is posted in Main when the session closes. Normally posts a short line in this topic with two buttons: " +
                 "close or keep working — nothing closes without the user's tap, and if they keep it open you get an event=\"close_declined\" message. " +
-                "With now=true (only in answer to close_requested) the session closes right away. Don't start new work after calling it.",
+                "With now=true the session closes right away, no buttons: use it when the user explicitly told you to close/end/finish this session " +
+                "(\"close it\", \"end the session\", \"we're done, close\"), or for an event=\"close_requested\" message. Never ask the user to confirm an explicit close. " +
+                "Without such a request (you just think the subject is done) leave now unset. Don't start new work after calling it.",
             "inputSchema" to json(
                 "type" to "object",
                 "properties" to json(
                     "summary" to json("type" to "string", "description" to Sessions.SUMMARY_SPEC),
                     "short" to json("type" to "string", "description" to "One sentence for the close prompt in this topic: what was resolved. Plain text. Not needed with now=true."),
-                    "now" to json("type" to "boolean", "description" to "True only when answering event=\"close_requested\": close without asking."),
+                    "now" to json("type" to "boolean", "description" to "Close without asking: the user explicitly asked to close this session, or answering event=\"close_requested\"."),
                 ),
                 "required" to listOf("summary"),
             ),
@@ -239,7 +241,8 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         if (!Sessions.isChild) add(json(
             "name" to "end_session",
             "description" to "Close a side session: it writes its own summary (posted in Main), then it is stopped and its topic deleted. Only when the user asks " +
-                "for it in Main — a session that finished its subject asks the user itself (request_close).",
+                "for it in Main, or a side session relays that the user explicitly asked it to close — act on that at once, no confirmation. " +
+                "A session that merely finished its subject asks the user itself (request_close).",
             "inputSchema" to json(
                 "type" to "object",
                 "properties" to json("name" to json("type" to "string", "description" to "Side session name.")),
@@ -310,7 +313,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             val deleted = Sessions.drop(scope, s)
             return text(if (deleted) "${s.name} wasn't running; closed without a summary" else "${s.name} wasn't running; its topic couldn't be deleted")
         }
-        // The session writes its own summary (request_close now=true); drop once it lands, or after 3 min regardless.
+        // The session writes its own summary and closes itself (request_close now=true); drop it here only if it hasn't within 3 min.
         Sessions.enqueue(s, "notifications/claude/channel", buildJsonObject {
             put("content", "The user asked in Main to close this session. Call request_close with now=true and your summary.")
             put("meta", buildJsonObject {
@@ -320,8 +323,8 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         })
         scope.launch {
             val deadline = System.currentTimeMillis() + 180_000
-            while (System.currentTimeMillis() < deadline && !Sessions.hasSummary(s.name) && Sessions.alive(s)) delay(1000)
-            Sessions.byName(s.name)?.let { Sessions.drop(scope, it) }
+            while (System.currentTimeMillis() < deadline && Sessions.alive(s)) delay(1000)
+            Sessions.byName(s.name)?.takeIf { Sessions.alive(it) }?.let { Sessions.drop(scope, it) }
         }
         return text("asked ${s.name} to write its summary; it closes when that's done (at most 3 min). Nothing else to do.")
     }
@@ -339,8 +342,12 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         val s = Sessions.self() ?: return text("request_close works only in a side session", error = true)
         val summary = args.anyStr("summary")?.trim()?.ifEmpty { null } ?: throw IllegalArgumentException("summary required")
         Sessions.saveSummary(s.name, summary)
-        // Main's server is waiting on the summary file (end_session) and drops the session itself.
-        if (args["now"]?.jsonPrimitive?.booleanOrNull == true) return text("summary saved; this session is closing now")
+        // Explicit close: no buttons. The child drops itself (summary in Main, topic deleted, tmux killed last),
+        // after a beat so this result reaches the model first.
+        if (args["now"]?.jsonPrimitive?.booleanOrNull == true) {
+            scope.launch { delay(1500); Sessions.drop(scope, s) }
+            return text("summary saved; this session is closing now")
+        }
         val short = args.anyStr("short")?.trim()?.ifEmpty { null } ?: "this subject is done."
         val markup = InlineKeyboardMarkup(listOf(
             listOf(
