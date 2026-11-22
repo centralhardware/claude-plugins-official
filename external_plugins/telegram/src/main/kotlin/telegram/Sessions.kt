@@ -81,8 +81,10 @@ object Sessions {
 
     /** Everyone [id] may message: its coordinator, its workers and its sibling workers. */
     fun peersOf(id: String): List<String> {
+        // Main reaches every session and every session reaches Main; otherwise messages stay inside one network.
+        if (id == MAIN) return load().map { it.name }
         val root = rootOf(id)
-        return (listOf(root) + workersOf(root).map { it.name }).distinct().filter { it != id }
+        return (listOf(MAIN, root) + workersOf(root).map { it.name }).distinct().filter { it != id }
     }
 
     /** Queue a notification for any network member, Main included. */
