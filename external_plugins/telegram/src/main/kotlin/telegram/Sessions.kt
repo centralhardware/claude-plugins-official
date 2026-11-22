@@ -1,6 +1,9 @@
 package telegram
 
 import dev.inmo.tgbotapi.extensions.api.chat.forum.createForumTopic
+import dev.inmo.tgbotapi.extensions.api.chat.forum.deleteForumTopic
+import dev.inmo.tgbotapi.types.MessageThreadId
+import dev.inmo.tgbotapi.types.message.HTMLParseMode
 import dev.inmo.tgbotapi.extensions.api.send.sendMessage
 import dev.inmo.tgbotapi.extensions.api.send.setMessageReaction
 import dev.inmo.tgbotapi.types.reactions.Reaction
@@ -13,7 +16,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
 /**
- * Named side sessions (/ns <name>): a separate `claude` in its own tmux session,
+ * Named side sessions, started by the main session (spawn_session): a separate `claude` in its own tmux session,
  * bound to one forum topic of the DM.
  *
  * Telegram allows one getUpdates consumer per token, so the main server keeps
@@ -253,7 +256,32 @@ object Sessions {
 
     fun interrupt(s: NamedSession) = tmux("send-keys", "-t", s.tmux, "Escape")
 
-    // ── Summary on /nsdrop ───────────────────────────────────────────────────
+    // ── Close: summary in Main, topic deleted ────────────────────────────────
+
+    /** Stops [s], posts its summary in Main and deletes its topic. True if the topic was deleted. */
+    suspend fun drop(scope: CoroutineScope, s: NamedSession): Boolean {
+        val transcript = transcriptOf(s)
+        end(s)
+        // The topic is about to vanish: leave a summary of the session in Main.
+        scope.launch {
+            val body = if (transcript == null) "⚠️ no summary: transcript not found"
+                else summarize(transcript).fold({ it }, { "⚠️ no summary: " + (it.message ?: "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") })
+            val thread = threadOf(mainThread(s.chatId))
+            val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
+            try {
+                Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (dropped)\n\n$body".take(4096),
+                    parseMode = HTMLParseMode, threadId = thread)
+            } catch (e: Exception) {
+                // Model-written HTML can be malformed: fall back to the raw text.
+                log("summary HTML rejected, sending plain: ${e.describe()}")
+                try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped)\n\n$body".take(4096), threadId = thread) }
+                catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
+            }
+        }
+        return try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
+            catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
+    }
+
 
     private val configDir get() = File(System.getenv("CLAUDE_CONFIG_DIR") ?: "${System.getProperty("user.home")}/.claude")
 

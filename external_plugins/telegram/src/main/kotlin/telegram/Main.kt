@@ -252,7 +252,7 @@ fun main() {
         scope.launch { pollLoop(inbound, miniApp) }
         Scheduled.start(scope) { ownsPollerLock && !shuttingDown }
     } else {
-        // Side session (/ns): the main server polls and spools this topic's traffic here.
+        // Side session (spawn_session): the main server polls and spools this topic's traffic here.
         log("side session \"$side\" — not polling, reading the spool")
         Sessions.self()?.let { lastThread[it.chatId] = it.threadId }
         scope.launch {

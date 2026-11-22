@@ -205,7 +205,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         // Side sessions are spawned by the main session only; a child can't nest them.
         if (!Sessions.isChild) add(json(
             "name" to "spawn_session",
-            "description" to "Start a separate Claude session in a new forum topic — the same thing the user's /ns <name> command does — " +
+            "description" to "Start a separate Claude session in a new forum topic " +
                 "and hand it the message that started the subject. Use when a message in Main opens a new subject that will need a continuous " +
                 "back-and-forth: from then on every message in that topic goes to the new session, never to this one.",
             "inputSchema" to json(
@@ -225,6 +225,16 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "name" to "restart_session",
             "description" to "Relaunch a side session in its existing topic when it didn't check in (no \"alive: <name>\" message after spawn_session). " +
                 "Kills its tmux, starts a fresh claude there, keeps the topic and any undelivered messages.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json("name" to json("type" to "string", "description" to "Side session name.")),
+                "required" to listOf("name"),
+            ),
+        ))
+        if (!Sessions.isChild) add(json(
+            "name" to "end_session",
+            "description" to "Close a side session: stops it, posts a summary of it in Main and deletes its topic. Only when the user asks " +
+                "for it in Main — a session that finished its subject asks the user itself (request_close).",
             "inputSchema" to json(
                 "type" to "object",
                 "properties" to json("name" to json("type" to "string", "description" to "Side session name.")),
@@ -294,6 +304,13 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "if no \"alive: $name\" has arrived by then, find out why (tmux capture-pane -p -t tg-$name, the plugin log), fix the cause " +
             "if you can, call restart_session once, and tell the user in Main what you found. If it has arrived, do nothing."
 
+    private suspend fun endSession(args: JsonObject): JsonObject {
+        val name = args.anyStr("name")?.lowercase() ?: throw IllegalArgumentException("name required")
+        val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
+        val deleted = Sessions.drop(scope, s)
+        return text(if (deleted) "ended ${s.name}; topic deleted, summary on its way to Main" else "ended ${s.name}, but its topic couldn't be deleted")
+    }
+
     private suspend fun restartSession(args: JsonObject): JsonObject {
         val name = args.anyStr("name")?.lowercase() ?: throw IllegalArgumentException("name required")
         val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
@@ -321,7 +338,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         val name = (args.anyStr("name") ?: throw IllegalArgumentException("name required")).lowercase()
         val message = args.anyStr("message") ?: throw IllegalArgumentException("message required")
         val s = Sessions.spawn(scope, name, chatId).getOrElse { return text("spawn_session failed: ${it.message}", error = true) }
-        Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" started for this subject. Messages in this topic go to it; /nsend here stops it.", threadId = threadOf(s.threadId))
+        Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" started for this subject. Messages in this topic go to it.", threadId = threadOf(s.threadId))
         forwardOriginal(chatId, s, args)
         // Spooled now; the child drains it once its own server is up (startup grace covers the prompts).
         handOff(s, chatId, message, args)
@@ -367,6 +384,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "forward_to_session" -> forwardToSession(args)
             "request_close" -> requestClose(args)
             "restart_session" -> restartSession(args)
+            "end_session" -> endSession(args)
             "schedule_message" -> scheduleMessage(args)
             "list_scheduled" -> listScheduled(args)
             "cancel_scheduled" -> cancelScheduled(args)

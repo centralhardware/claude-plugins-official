@@ -241,7 +241,7 @@ class Inbound(
         val cmd = token.substringBefore('@').lowercase()
         val target = token.substringAfter('@', "")
         if (target.isNotEmpty() && !target.equals(Tg.username, ignoreCase = true)) return false
-        if (cmd !in setOf("start", "help", "status", "cancel", "ns", "nsend", "nsdrop", "sessions")) return false
+        if (cmd !in setOf("start", "help", "status", "cancel")) return false
         val gated = dmCommandGate(msg) ?: return true
         val chatId = msg.chatIdStr
         val threadId = msg.topicThreadId
@@ -261,10 +261,8 @@ class Inbound(
                     "Text and photos are forwarded; replies and reactions come back.\n\n" +
                     "/start — pairing instructions\n" +
                     "/status — check your pairing state\n" +
-                    "/ns <name> — start a separate Claude session in a new topic\n" +
-                    "/nsend — stop the session of this topic\n" +
-                    "/nsdrop — stop it and delete its topic\n" +
-                    "/sessions — list side sessions",
+                    "/cancel — interrupt the running turn (in a session topic: that session's)\n\n" +
+                    "Side sessions are started and closed by the main session.",
             )
             "status" -> {
                 val (access, senderId) = gated
@@ -275,38 +273,6 @@ class Inbound(
                     val code = access.pending.entries.firstOrNull { it.value.senderId == senderId }?.key
                     say(if (code != null) "Pending pairing — run in Claude Code:\n\n/telegram:access pair $code" else "Not paired. Send me a message to get a pairing code.")
                 }
-            }
-            "ns" -> {
-                if (arg.isEmpty()) return say("Usage: /ns <name> — starts a separate Claude session in a new topic.").let { true }
-                Sessions.spawn(scope, arg.lowercase(), chatId).fold(
-                    onSuccess = { s ->
-                        try {
-                            Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" is starting (tmux ${s.tmux}). Messages in this topic go to it; /nsend here stops it.", threadId = threadOf(s.threadId))
-                        } catch (_: Exception) {}
-                        if (threadId != s.threadId) say("Started \"${s.name}\" in its own topic.")
-                    },
-                    onFailure = { say("⚠️ ${it.message ?: it.toString()}") },
-                )
-            }
-            "nsend" -> {
-                val s = (if (arg.isNotEmpty()) Sessions.byName(arg.lowercase()) else side)
-                    ?: return say("Not a session topic. Usage: /nsend <name>, or /nsend inside its topic.").let { true }
-                Sessions.end(s)
-                say("🛑 Session \"${s.name}\" stopped. The topic stays for history.")
-            }
-            "nsdrop" -> {
-                val s = (if (arg.isNotEmpty()) Sessions.byName(arg.lowercase()) else side)
-                    ?: return say("Not a session topic. Usage: /nsdrop <name>, or /nsdrop inside its topic.").let { true }
-                val deleted = dropSession(s)
-                // Inside the dropped topic there's nowhere left to answer.
-                if (threadId != s.threadId || !deleted) {
-                    say(if (deleted) "🗑 Session \"${s.name}\" stopped and its topic deleted." else "🛑 Session \"${s.name}\" stopped, but the topic couldn't be deleted.")
-                }
-            }
-            "sessions" -> {
-                val list = Sessions.load()
-                say(if (list.isEmpty()) "No side sessions. Start one with /ns <name>."
-                    else list.joinToString("\n") { "${if (Sessions.alive(it)) "🟢" else "⚫"} ${it.name} (tmux ${it.tmux})" })
             }
             "cancel" -> if (side != null) {
                 typing.stop(chatId)
@@ -373,30 +339,6 @@ class Inbound(
         }
     }
 
-    /** Stops [s], posts its summary in Main and deletes its topic. True if the topic was deleted. */
-    private suspend fun dropSession(s: NamedSession): Boolean {
-        val transcript = Sessions.transcriptOf(s)
-        Sessions.end(s)
-        // The topic is about to vanish: leave a summary of the session in Main.
-        scope.launch {
-            val body = if (transcript == null) "⚠️ no summary: transcript not found"
-                else Sessions.summarize(transcript).fold({ it }, { "⚠️ no summary: " + (it.message ?: "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") })
-            val thread = threadOf(Sessions.mainThread(s.chatId))
-            val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
-            try {
-                Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (dropped)\n\n$body".take(4096),
-                    parseMode = HTMLParseMode, threadId = thread)
-            } catch (e: Exception) {
-                // Model-written HTML can be malformed: fall back to the raw text.
-                log("summary HTML rejected, sending plain: ${e.describe()}")
-                try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped)\n\n$body".take(4096), threadId = thread) }
-                catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
-            }
-        }
-        return try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
-            catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
-    }
-
     /** Taps on a side session's request_close prompt: close (drop) or keep working. */
     private suspend fun onCloseButton(cq: DataCallbackQuery, answer: suspend (String?) -> Unit) {
         val m = CLOSE_CALLBACK_RE.matchEntire(cq.data) ?: return answer(null)
@@ -408,7 +350,7 @@ class Inbound(
         if (message != null) try { Tg.bot.editMessageReplyMarkup(message.chat.id, message.messageId, replyMarkup = null) } catch (_: Exception) {}
         if (s == null) return answer("This session is already gone.")
         when (action) {
-            "drop" -> { answer("🗑 Closing"); dropSession(s) }
+            "drop" -> { answer("🗑 Closing"); Sessions.drop(scope, s) }
             else -> {
                 answer("↩️ Kept open")
                 emitEvent(s.chatId, s.threadId, "Keep open", cq.from, mapOf("event" to "close_declined"))
