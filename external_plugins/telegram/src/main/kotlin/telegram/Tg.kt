@@ -31,7 +31,8 @@ object Tg {
         DefaultKTgBotAPIKSLog = KSLog { level, _, message, throwable ->
             if (level >= LogLevel.ERROR && throwable !is BotException && throwable?.isTimeout() != true) log("ktgbotapi: $message${throwable?.let { " ($it)" } ?: ""}")
         }
-        bot = telegramBot(token)
+        // TELEGRAM_RELAY_URL: send Bot API calls through tg-webhook-relay, which logs them.
+        bot = Config.env("TELEGRAM_RELAY_URL")?.trimEnd('/')?.let { telegramBot(token, apiUrl = it) } ?: telegramBot(token)
     }
 }
 
