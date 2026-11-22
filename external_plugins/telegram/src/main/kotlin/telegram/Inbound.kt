@@ -349,27 +349,42 @@ class Inbound(
 
     // ── Permission relay ─────────────────────────────────────────────────────
 
-    private fun permKeyboard(requestId: String, withMore: Boolean) = InlineKeyboardMarkup(
+    private fun permKeyboard(requestId: String) = InlineKeyboardMarkup(
         listOf(
-            listOfNotNull(
-                if (withMore) CallbackDataInlineKeyboardButton("See more", "perm:more:$requestId") else null,
+            listOf(
                 CallbackDataInlineKeyboardButton("✅ Allow", "perm:allow:$requestId"),
                 CallbackDataInlineKeyboardButton("❌ Deny", "perm:deny:$requestId"),
             ),
         ),
     )
 
+    /** Full prompt text: tool, description and the pretty-printed input, capped to Telegram's 4096 limit. */
+    private fun permText(toolName: String, description: String, preview: String): String {
+        val pretty = try {
+            Json { prettyPrint = true }.encodeToString(JsonElement.serializer(), Json.parseToJsonElement(preview))
+        } catch (_: Exception) { preview }
+        val text = buildString {
+            append("🔐 Permission: ").append(toolName)
+            if (description.isNotBlank()) append("\n\n").append(description)
+            if (pretty.isNotBlank()) append("\n\n").append(pretty)
+        }
+        return if (text.length > 3900) text.take(3900) + "\n…" else text
+    }
+
     /** permission_request from Claude Code → every allowlisted DM (never groups). */
     fun onPermissionRequest(params: JsonObject) {
         val requestId = params.str("request_id") ?: return
         val toolName = params.str("tool_name") ?: ""
-        pendingPermissions[requestId] = Triple(toolName, params.str("description") ?: "", params.str("input_preview") ?: "")
+        val description = params.str("description") ?: ""
+        val preview = params.str("input_preview") ?: ""
+        pendingPermissions[requestId] = Triple(toolName, description, preview)
+        val text = permText(toolName, description, preview)
         val self = Sessions.self()
         for (chatId in AccessStore.load().allowFrom) {
             val thread = self?.takeIf { it.chatId == chatId }?.threadId
             scope.launch {
                 try {
-                    Tg.bot.sendMessage(chatIdOf(chatId), "🔐 Permission: $toolName", threadId = threadOf(thread), replyMarkup = permKeyboard(requestId, true))
+                    Tg.bot.sendMessage(chatIdOf(chatId), text, threadId = threadOf(thread), replyMarkup = permKeyboard(requestId))
                 } catch (e: Exception) { log("permission_request send to $chatId failed: ${e.describe()}") }
             }
         }
@@ -383,17 +398,8 @@ class Inbound(
         val (behavior, requestId) = m.destructured
         val message = (cq as? MessageCallbackQuery)?.message
 
-        if (behavior == "more") {
-            val (toolName, description, preview) = pendingPermissions[requestId] ?: return answer("Details no longer available.")
-            val pretty = try {
-                Json { prettyPrint = true }.encodeToString(JsonElement.serializer(), Json.parseToJsonElement(preview))
-            } catch (_: Exception) { preview }
-            val expanded = "🔐 Permission: $toolName\n\ntool_name: $toolName\ndescription: $description\ninput_preview:\n$pretty"
-            if (message != null) {
-                try { Tg.bot.editMessageText(message.chat.id, message.messageId, expanded, replyMarkup = permKeyboard(requestId, false)) } catch (_: Exception) {}
-            }
-            return answer()
-        }
+        // Legacy "See more" taps on prompts sent before the button was dropped: just acknowledge.
+        if (behavior == "more") return answer()
 
         try {
             val thread = (message as? PossiblyTopicMessage)?.threadId?.long
