@@ -18,6 +18,8 @@ import dev.inmo.tgbotapi.types.buttons.InlineKeyboardButtons.CallbackDataInlineK
 import dev.inmo.tgbotapi.types.buttons.InlineKeyboardMarkup
 import dev.inmo.tgbotapi.types.buttons.KeyboardMarkup
 import dev.inmo.tgbotapi.types.polls.InputPollOption
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 import java.io.File
 
@@ -191,13 +193,16 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         // The side session's own exit: it proposes, the user confirms with a button.
         if (Sessions.isChild) add(json(
             "name" to "request_close",
-            "description" to "Ask the user to close this side session once its subject is resolved or completed. Posts the summary in this " +
-                "session's topic with two buttons: close (stops the session, deletes the topic, posts a summary in Main) or keep working. Nothing closes without the user's tap. If they keep it open you get an event=\"close_declined\" message; " +
-                "otherwise this session is stopped — don't start new work after calling it.",
+            "description" to "Close this side session once its subject is resolved or completed, or when an event=\"close_requested\" message asks you to. " +
+                "You write the session summary yourself; it is posted in Main when the session closes. Normally posts a short line in this topic with two buttons: " +
+                "close or keep working — nothing closes without the user's tap, and if they keep it open you get an event=\"close_declined\" message. " +
+                "With now=true (only in answer to close_requested) the session closes right away. Don't start new work after calling it.",
             "inputSchema" to json(
                 "type" to "object",
                 "properties" to json(
-                    "summary" to json("type" to "string", "description" to "One or two sentences: what was resolved or done. Plain text."),
+                    "summary" to json("type" to "string", "description" to Sessions.SUMMARY_SPEC),
+                    "short" to json("type" to "string", "description" to "One sentence for the close prompt in this topic: what was resolved. Plain text. Not needed with now=true."),
+                    "now" to json("type" to "boolean", "description" to "True only when answering event=\"close_requested\": close without asking."),
                 ),
                 "required" to listOf("summary"),
             ),
@@ -223,7 +228,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         ))
         if (!Sessions.isChild) add(json(
             "name" to "restart_session",
-            "description" to "Relaunch a side session in its existing topic when it didn't check in (no \"alive: <name>\" message after spawn_session). " +
+            "description" to "Relaunch a side session in its existing topic that is stuck. The server already restarts a session once by itself when it doesn't check in within 3 minutes. " +
                 "Kills its tmux, starts a fresh claude there, keeps the topic and any undelivered messages.",
             "inputSchema" to json(
                 "type" to "object",
@@ -233,7 +238,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         ))
         if (!Sessions.isChild) add(json(
             "name" to "end_session",
-            "description" to "Close a side session: stops it, posts a summary of it in Main and deletes its topic. Only when the user asks " +
+            "description" to "Close a side session: it writes its own summary (posted in Main), then it is stopped and its topic deleted. Only when the user asks " +
                 "for it in Main — a session that finished its subject asks the user itself (request_close).",
             "inputSchema" to json(
                 "type" to "object",
@@ -298,17 +303,27 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         return text("forwarded to session ${s.name}")
     }
 
-    /** What Main must do after starting a session: it has no clock, so it schedules its own check. */
-    private fun checkInNote(name: String) =
-        "It will SendMessage you \"alive: $name\" as its first action. Now schedule a one-shot check in 3 minutes (CronCreate): " +
-            "if no \"alive: $name\" has arrived by then, find out why (tmux capture-pane -p -t tg-$name, the plugin log), fix the cause " +
-            "if you can, call restart_session once, and tell the user in Main what you found. If it has arrived, do nothing."
-
     private suspend fun endSession(args: JsonObject): JsonObject {
         val name = args.anyStr("name")?.lowercase() ?: throw IllegalArgumentException("name required")
         val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
-        val deleted = Sessions.drop(scope, s)
-        return text(if (deleted) "ended ${s.name}; topic deleted, summary on its way to Main" else "ended ${s.name}, but its topic couldn't be deleted")
+        if (!Sessions.alive(s)) {
+            val deleted = Sessions.drop(scope, s)
+            return text(if (deleted) "${s.name} wasn't running; closed without a summary" else "${s.name} wasn't running; its topic couldn't be deleted")
+        }
+        // The session writes its own summary (request_close now=true); drop once it lands, or after 3 min regardless.
+        Sessions.enqueue(s, "notifications/claude/channel", buildJsonObject {
+            put("content", "The user asked in Main to close this session. Call request_close with now=true and your summary.")
+            put("meta", buildJsonObject {
+                put("chat_id", s.chatId); put("thread_id", s.threadId.toString()); put("event", "close_requested")
+                put("ts", java.time.Instant.now().toString())
+            })
+        })
+        scope.launch {
+            val deadline = System.currentTimeMillis() + 180_000
+            while (System.currentTimeMillis() < deadline && !Sessions.hasSummary(s.name) && Sessions.alive(s)) delay(1000)
+            Sessions.byName(s.name)?.let { Sessions.drop(scope, it) }
+        }
+        return text("asked ${s.name} to write its summary; it closes when that's done (at most 3 min). Nothing else to do.")
     }
 
     private suspend fun restartSession(args: JsonObject): JsonObject {
@@ -316,19 +331,24 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
         val fresh = Sessions.restart(scope, s).getOrElse { return text("restart_session failed: ${it.message}", error = true) }
         try { Tg.bot.sendMessage(chatIdOf(s.chatId), "🔄 Session \"${s.name}\" restarted.", threadId = threadOf(s.threadId)) } catch (_: Exception) {}
-        return text("restarted ${fresh.name}. " + checkInNote(fresh.name))
+        Sessions.watchCheckIn(scope, fresh, retry = false)
+        return text("restarted ${fresh.name}; the server watches its check-in and reports in Main only if it fails.")
     }
 
     private suspend fun requestClose(args: JsonObject): JsonObject {
         val s = Sessions.self() ?: return text("request_close works only in a side session", error = true)
         val summary = args.anyStr("summary")?.trim()?.ifEmpty { null } ?: throw IllegalArgumentException("summary required")
+        Sessions.saveSummary(s.name, summary)
+        // Main's server is waiting on the summary file (end_session) and drops the session itself.
+        if (args["now"]?.jsonPrimitive?.booleanOrNull == true) return text("summary saved; this session is closing now")
+        val short = args.anyStr("short")?.trim()?.ifEmpty { null } ?: "this subject is done."
         val markup = InlineKeyboardMarkup(listOf(
             listOf(
                 CallbackDataInlineKeyboardButton("🗑 Close", "${CLOSE_PREFIX}drop:${s.name}"),
                 CallbackDataInlineKeyboardButton("↩️ Keep working", "${CLOSE_PREFIX}keep:${s.name}"),
             ),
         ))
-        Tg.bot.sendMessage(chatIdOf(s.chatId), "✅ Looks done: ${summary.take(3500)}\n\nClose session \"${s.name}\"?",
+        Tg.bot.sendMessage(chatIdOf(s.chatId), "✅ Looks done: ${short.take(3500)}\n\nClose session \"${s.name}\"?",
             threadId = threadOf(s.threadId), replyMarkup = markup)
         return text("asked the user to confirm closing; wait for their choice")
     }
@@ -342,7 +362,9 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         forwardOriginal(chatId, s, args)
         // Spooled now; the child drains it once its own server is up (startup grace covers the prompts).
         handOff(s, chatId, message, args)
-        return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it. " + checkInNote(s.name))
+        Sessions.watchCheckIn(scope, s)
+        return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it. " +
+            "The server checks that it comes up (and restarts it once if not); nothing to schedule or wait for.")
     }
 
     private fun scheduleMessage(args: JsonObject): JsonObject {

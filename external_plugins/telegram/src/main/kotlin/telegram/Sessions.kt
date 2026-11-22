@@ -44,11 +44,6 @@ object Sessions {
     /** Side session: the tmux session Main runs in, to find it among the ListAgents peers. */
     val mainTmux: String get() = System.getenv("TELEGRAM_MAIN_TMUX")?.ifBlank { null } ?: "claude"
 
-    /** Side session: the check-in Main waits for — sent by the model itself, so it proves the whole session works. */
-    fun checkInInstructions(name: String) = "\n\nYou are the side session \"$name\", started from the Main session. Your FIRST action, before " +
-        "anything else: call ListAgents, find the peer session running in tmux session \"$mainTmux\" (that is Main), and SendMessage it " +
-        "exactly \"alive: $name\". Main treats a missing check-in as a dead session and will restart this one. Do it once per start; no reply is expected."
-
     fun load(): List<NamedSession> = synchronized(lock) {
         try { json.decodeFromString(ListSerializer(NamedSession.serializer()), file.readText()) } catch (_: Exception) { emptyList() }
     }
@@ -169,6 +164,44 @@ object Sessions {
 
     // ── Liveness ─────────────────────────────────────────────────────────────
 
+    /** Written by the child's server when it hands over its first message; the parent's watcher waits for it. */
+    private fun aliveFile(name: String) = File(spoolRoot, "$name.alive")
+
+    fun markAlive(name: String) { spoolRoot.mkdirs(); aliveFile(name).writeText(System.currentTimeMillis().toString()) }
+
+    fun checkedIn(s: NamedSession) = aliveFile(s.name).let { it.isFile && (it.readText().trim().toLongOrNull() ?: 0) >= s.createdAt }
+
+    /**
+     * Parent side: no check-in within [timeoutMs] → restart once, then tell Main only if it still fails.
+     * Runs in the server, so the Main model neither waits nor schedules anything.
+     */
+    fun watchCheckIn(scope: CoroutineScope, s: NamedSession, timeoutMs: Long = 180_000, retry: Boolean = true) {
+        scope.launch {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                val cur = byName(s.name) ?: return@launch
+                if (cur.createdAt != s.createdAt) return@launch  // restarted meanwhile: that launch has its own watcher
+                if (checkedIn(cur)) { log("side session \"${s.name}\" checked in"); return@launch }
+                delay(1000)
+            }
+            val cur = byName(s.name)?.takeIf { it.createdAt == s.createdAt } ?: return@launch
+            val pane = paneText(cur.tmux)?.lines()?.filter { it.isNotBlank() }?.takeLast(8)?.joinToString("\n").orEmpty()
+            log("side session \"${s.name}\" didn't check in; pane:\n$pane")
+            if (retry) {
+                restart(scope, cur).onSuccess { fresh ->
+                    try { Tg.bot.sendMessage(chatIdOf(s.chatId), "🔄 No sign of life after 3 min — restarted.", threadId = threadOf(s.threadId)) } catch (_: Exception) {}
+                    watchCheckIn(scope, fresh, timeoutMs, retry = false)
+                }
+            } else {
+                val esc = pane.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                try {
+                    Tg.bot.sendMessage(chatIdOf(s.chatId), "⚠️ Session \"${s.name}\" didn't start even after a restart. Last screen:\n<pre>$esc</pre>".take(4096),
+                        parseMode = HTMLParseMode, threadId = threadOf(mainThread(s.chatId)))
+                } catch (e: Exception) { log("check-in failure post failed: ${e.describe()}") }
+            }
+        }
+    }
+
     /** Child side: 👀 on the first delivered message, or a short line when there is none to react to. */
     suspend fun signalAlive(chatId: String, threadId: Long?, messageId: Long?) {
         try {
@@ -246,6 +279,8 @@ object Sessions {
     fun remove(name: String) {
         save(load().filter { it.name != name })
         File(spoolRoot, name).deleteRecursively()
+        aliveFile(name).delete()
+        summaryFile(name).delete()
     }
 
     /** Kills the tmux session and forgets the binding. */
@@ -258,23 +293,39 @@ object Sessions {
 
     // ── Close: summary in Main, topic deleted ────────────────────────────────
 
-    /** Stops [s], posts its summary in Main and deletes its topic. True if the topic was deleted. */
+    /** The summary the session wrote itself (request_close), kept until it is posted at close. */
+    private fun summaryFile(name: String) = File(spoolRoot, "$name.summary")
+
+    /** Child side: store this session's own closing summary (Telegram HTML). */
+    fun saveSummary(name: String, html: String) {
+        spoolRoot.mkdirs()
+        val tmp = File(spoolRoot, "$name.summary.tmp")
+        tmp.writeText(html)
+        Files.move(tmp.toPath(), summaryFile(name).toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+    }
+
+    fun hasSummary(name: String) = summaryFile(name).isFile
+
+    /**
+     * Stops [s], posts the summary it wrote itself in Main and deletes its topic.
+     * No transcript re-read or headless run: the session is the only context that spends tokens on it.
+     * True if the topic was deleted.
+     */
     suspend fun drop(scope: CoroutineScope, s: NamedSession): Boolean {
-        val transcript = transcriptOf(s)
+        val body = try { summaryFile(s.name).readText().trim().ifEmpty { null } } catch (_: Exception) { null }
+            ?: "⚠️ no summary: the session closed without writing one"
         end(s)
-        // The topic is about to vanish: leave a summary of the session in Main.
+        summaryFile(s.name).delete()
         scope.launch {
-            val body = if (transcript == null) "⚠️ no summary: transcript not found"
-                else summarize(transcript).fold({ it }, { "⚠️ no summary: " + (it.message ?: "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") })
             val thread = threadOf(mainThread(s.chatId))
             val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
             try {
-                Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (dropped)\n\n$body".take(4096),
+                Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (closed)\n\n$body".take(4096),
                     parseMode = HTMLParseMode, threadId = thread)
             } catch (e: Exception) {
                 // Model-written HTML can be malformed: fall back to the raw text.
                 log("summary HTML rejected, sending plain: ${e.describe()}")
-                try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped)\n\n$body".take(4096), threadId = thread) }
+                try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (closed)\n\n$body".take(4096), threadId = thread) }
                 catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
             }
         }
@@ -282,79 +333,13 @@ object Sessions {
             catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
     }
 
-
-    private val configDir get() = File(System.getenv("CLAUDE_CONFIG_DIR") ?: "${System.getProperty("user.home")}/.claude")
-
-    /**
-     * The side session's transcript: Claude Code's sessions/<pid>.json records the
-     * tmux pane and session id, the transcript is projects/<cwd>/<id>.jsonl. Must be
-     * read before [end] — the pid file goes away with the process.
-     */
-    fun transcriptOf(s: NamedSession): File? = try {
-        val meta = File(configDir, "sessions").listFiles { f -> f.name.endsWith(".json") }.orEmpty()
-            .mapNotNull { f -> try { Json.parseToJsonElement(f.readText()).jsonObject } catch (_: Exception) { null } }
-            .filter { it["tmux"]?.jsonPrimitive?.contentOrNull?.startsWith("${s.tmux}:") == true }
-            .maxByOrNull { it["startedAt"]?.jsonPrimitive?.longOrNull ?: 0 }
-        val id = meta?.get("sessionId")?.jsonPrimitive?.contentOrNull
-        val cwd = meta?.get("cwd")?.jsonPrimitive?.contentOrNull
-        if (id == null || cwd == null) { log("transcript: no sessions/*.json with tmux ${s.tmux}"); null }
-        else File(configDir, "projects/${cwd.replace(Regex("[^A-Za-z0-9]"), "-")}/$id.jsonl").let { f ->
-            if (f.isFile) f else { log("transcript: ${f.path} missing"); null }
-        }
-    } catch (e: Exception) { log("transcript lookup failed: ${e.describe()}"); null }
-
-    /** User and assistant prose from a transcript, tool traffic dropped, newest kept. */
-    private fun dialogue(f: File, maxChars: Int = 60_000): String {
-        val parts = f.readLines().mapNotNull { line ->
-            val o = try { Json.parseToJsonElement(line).jsonObject } catch (_: Exception) { return@mapNotNull null }
-            val role = o["type"]?.jsonPrimitive?.contentOrNull?.takeIf { it == "user" || it == "assistant" } ?: return@mapNotNull null
-            val content = (o["message"] as? JsonObject)?.get("content") ?: return@mapNotNull null
-            val text = when (content) {
-                is JsonPrimitive -> content.contentOrNull
-                is JsonArray -> content.mapNotNull { b ->
-                    (b as? JsonObject)?.takeIf { it["type"]?.jsonPrimitive?.contentOrNull == "text" }?.get("text")?.jsonPrimitive?.contentOrNull
-                }.joinToString("\n")
-                else -> null
-            }?.trim()
-            if (text.isNullOrEmpty() || text.startsWith("<system-reminder>")) null else "[$role] $text"
-        }
-        // PR/release/commit URLs live in tool output, which is dropped above: list them so the summary can link.
-        val urls = Regex("""https://github\.com/[\w.-]+/[\w.-]+/(?:pull/\d+|releases/tag/[\w.%-]+|commit/[0-9a-f]{7,40})""")
-            .findAll(f.readText().replace("\\/", "/")).map { it.value }.distinct().toList().takeLast(30)
-        val links = if (urls.isEmpty()) "" else "\n\n[links seen in tool output]\n" + urls.joinToString("\n")
-        return parts.joinToString("\n\n").takeLast(maxChars - links.length) + links
-    }
-
-    /** A short summary via headless `claude -p`; Result.failure carries a reason for the user. */
-    suspend fun summarize(f: File): Result<String> = withContext(Dispatchers.IO) {
-        val text = dialogue(f).ifBlank { return@withContext Result.failure(Exception("empty transcript")) }
-        val prompt = "Summarize this Claude Code session for its owner. English, addressed to them as \"you\", formatted as Telegram HTML " +
-            "(only <b>, <i>, <code>, <a href>, <blockquote expandable>; • for bullets; escape & < > in plain text; no markdown). Exact order: " +
-            "1) <b>Why</b>: the owner's motivation or problem that started the session, one or two sentences; " +
-            "2) <b>Outcome</b>: what it led to, one or two sentences (meaning, not a play-by-play; no thread ids or Telegram details); " +
-            "3) <b>Done</b>: at most 5 one-line outcome bullets; every PR, release or commit mentioned must be an <a href> link, " +
-            "using the URLs from the transcript or the [links seen in tool output] list; " +
-            "4) everything else (numbers, caveats, side notes) inside ONE <blockquote expandable>; " +
-            "5) last, <b>Needs you</b>: only real blockers — something that stays broken or unfinished until the owner acts. At most 3, one short line each, " +
-            "most important first; omit the section if there are none. Optional offers, nice-to-haves, open questions and things to consider " +
-            "are not blockers: leave them out or mention them briefly in the expandable quote. " +
-            "Never include secret values. Output only the summary: no heading, preamble, English corrections or footers. The transcript follows on stdin."
-        try {
-            val cmd = (Config.env("TELEGRAM_SUMMARY_CMD") ?: "claude -p --model sonnet").split(Regex("\\s+")) + prompt
-            val pb = ProcessBuilder(cmd).directory(File(System.getProperty("user.home")))
-            pb.environment().remove("TELEGRAM_SESSION_NAME")
-            // The owner's memory carries chat rules (footers, etc.) that don't belong in a summary.
-            pb.environment()["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
-            val p = pb.start()
-            p.outputStream.bufferedWriter().use { it.write(text) }
-            val out = async { p.inputStream.bufferedReader().readText() }
-            val err = async { p.errorStream.bufferedReader().readText() }
-            if (!p.waitFor(5, java.util.concurrent.TimeUnit.MINUTES)) { p.destroyForcibly(); return@withContext Result.failure(Exception("timed out")) }
-            val o = out.await().trim()
-            if (p.exitValue() == 0 && o.isNotEmpty()) Result.success(o)
-            else Result.failure(Exception("exit ${p.exitValue()}: ${(err.await().trim().ifEmpty { o }).takeLast(300)}"))
-        } catch (e: Exception) { Result.failure(Exception(e.describe())) }.onFailure { log("summary failed: ${it.message}") }
-    }
+    /** What a summary must look like — shown to the session in request_close's schema. */
+    const val SUMMARY_SPEC = "Telegram HTML summary of this whole session for its owner, in English, addressed as \"you\" " +
+        "(only <b>, <i>, <code>, <a href>, <blockquote expandable>; • for bullets; escape & < > in plain text; no markdown). Order: " +
+        "1) <b>Why</b>: what started the session, one or two sentences; 2) <b>Outcome</b>: what it led to, one or two sentences; " +
+        "3) <b>Done</b>: at most 5 one-line bullets, every PR, release or commit as an <a href> link; " +
+        "4) other details in ONE <blockquote expandable>; 5) <b>Needs you</b>: only real blockers, at most 3 lines, omitted if none. " +
+        "No secret values, no heading, no English-correction footer."
 
     /** Thread of the topic named "Main" in telegram-topics.json, if any. */
     fun mainThread(chatId: String): Long? = try {
