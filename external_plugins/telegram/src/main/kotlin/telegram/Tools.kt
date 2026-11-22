@@ -223,7 +223,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         ))
         if (!Sessions.isChild) add(json(
             "name" to "restart_session",
-            "description" to "Relaunch a side session in its existing topic when it didn't come up (an event=\"session_dead\" message names it). " +
+            "description" to "Relaunch a side session in its existing topic when it didn't check in (no \"alive: <name>\" message after spawn_session). " +
                 "Kills its tmux, starts a fresh claude there, keeps the topic and any undelivered messages.",
             "inputSchema" to json(
                 "type" to "object",
@@ -288,12 +288,18 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         return text("forwarded to session ${s.name}")
     }
 
+    /** What Main must do after starting a session: it has no clock, so it schedules its own check. */
+    private fun checkInNote(name: String) =
+        "It will SendMessage you \"alive: $name\" as its first action. Now schedule a one-shot check in 3 minutes (CronCreate): " +
+            "if no \"alive: $name\" has arrived by then, find out why (tmux capture-pane -p -t tg-$name, the plugin log), fix the cause " +
+            "if you can, call restart_session once, and tell the user in Main what you found. If it has arrived, do nothing."
+
     private suspend fun restartSession(args: JsonObject): JsonObject {
         val name = args.anyStr("name")?.lowercase() ?: throw IllegalArgumentException("name required")
         val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
         val fresh = Sessions.restart(scope, s).getOrElse { return text("restart_session failed: ${it.message}", error = true) }
         try { Tg.bot.sendMessage(chatIdOf(s.chatId), "🔄 Session \"${s.name}\" restarted.", threadId = threadOf(s.threadId)) } catch (_: Exception) {}
-        return text("restarted ${fresh.name}; expect session_alive when it checks in, session_dead if it doesn't")
+        return text("restarted ${fresh.name}. " + checkInNote(fresh.name))
     }
 
     private suspend fun requestClose(args: JsonObject): JsonObject {
@@ -319,7 +325,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         forwardOriginal(chatId, s, args)
         // Spooled now; the child drains it once its own server is up (startup grace covers the prompts).
         handOff(s, chatId, message, args)
-        return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it")
+        return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it. " + checkInNote(s.name))
     }
 
     private fun scheduleMessage(args: JsonObject): JsonObject {

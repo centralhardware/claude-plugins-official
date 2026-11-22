@@ -38,6 +38,14 @@ object Sessions {
     val selfName: String? = System.getenv("TELEGRAM_SESSION_NAME")?.trim()?.ifBlank { null }
     val isChild get() = selfName != null
 
+    /** Side session: the tmux session Main runs in, to find it among the ListAgents peers. */
+    val mainTmux: String get() = System.getenv("TELEGRAM_MAIN_TMUX")?.ifBlank { null } ?: "claude"
+
+    /** Side session: the check-in Main waits for — sent by the model itself, so it proves the whole session works. */
+    fun checkInInstructions(name: String) = "\n\nYou are the side session \"$name\", started from the Main session. Your FIRST action, before " +
+        "anything else: call ListAgents, find the peer session running in tmux session \"$mainTmux\" (that is Main), and SendMessage it " +
+        "exactly \"alive: $name\". Main treats a missing check-in as a dead session and will restart this one. Do it once per start; no reply is expected."
+
     fun load(): List<NamedSession> = synchronized(lock) {
         try { json.decodeFromString(ListSerializer(NamedSession.serializer()), file.readText()) } catch (_: Exception) { emptyList() }
     }
@@ -130,7 +138,6 @@ object Sessions {
      */
     fun restart(scope: CoroutineScope, s: NamedSession): Result<NamedSession> = runCatching {
         tmux("kill-session", "-t", "=${s.tmux}")
-        aliveMarker(s.name).delete()
         val fresh = s.copy(createdAt = System.currentTimeMillis())
         save(load().filter { it.name != s.name } + fresh)
         launch(scope, fresh, clearSpool = false)
@@ -145,6 +152,7 @@ object Sessions {
         val env = buildList {
             add("TELEGRAM_SESSION_NAME=$name")
             add("CLAUDE_TMUX_SESSION=${s.tmux}")
+            add("TELEGRAM_MAIN_TMUX=${Config.tmuxSession}")
             Config.token?.let { add("TELEGRAM_BOT_TOKEN=$it") }
             System.getenv("CLAUDE_CONFIG_DIR")?.let { add("CLAUDE_CONFIG_DIR=$it") }
             System.getenv("PATH")?.let { add("PATH=$it") }
@@ -154,16 +162,9 @@ object Sessions {
         val cmd = "env $env $launchCmd; exec \$SHELL"
         check(tmux("new-session", "-d", "-s", s.tmux, "-c", home, cmd)) { "tmux new-session failed." }
         scope.launch { answerPrompts(s.tmux) }
-        scope.launch { checkAlive(s) }
     }
 
     // ── Liveness ─────────────────────────────────────────────────────────────
-
-    private fun aliveMarker(name: String) = File(File(spoolRoot, name), ".alive")
-
-    /** Child side: its server is up and past the handshake. */
-    fun markAlive(name: String) = try { aliveMarker(name).apply { parentFile.mkdirs() }.writeText(System.currentTimeMillis().toString()) }
-        catch (e: Exception) { log("alive marker not written: ${e.describe()}") }
 
     /** Child side: 👀 on the first delivered message, or a short line when there is none to react to. */
     suspend fun signalAlive(chatId: String, threadId: Long?, messageId: Long?) {
@@ -174,51 +175,6 @@ object Sessions {
             log("sign of life failed: ${e.describe()}")
             try { Tg.bot.sendMessage(chatIdOf(chatId), "👀 Got it.", threadId = threadOf(threadId)) } catch (_: Exception) {}
         }
-    }
-
-    /** Parent side: hands a notification to the main session (set once its MCP server exists). */
-    @Volatile var notifyMain: ((String, JsonObject) -> Unit)? = null
-
-    private fun tellMain(s: NamedSession, event: String, content: String) {
-        val meta = buildJsonObject {
-            put("chat_id", s.chatId)
-            mainThread(s.chatId)?.let { put("thread_id", it.toString()) }
-            put("user", "system"); put("event", event); put("session", s.name)
-            put("ts", java.time.Instant.now().toString())
-        }
-        try { notifyMain?.invoke("notifications/claude/channel", buildJsonObject { put("content", content); put("meta", meta) }) }
-        catch (e: Exception) { log("main not told about ${s.name}: ${e.describe()}") }
-    }
-
-    /**
-     * Parent side: relays the child's check-in to the main session as session_alive;
-     * when none arrives, Main gets session_dead instead. A side session whose Telegram server never came up (e.g. Claude
-     * Code skipped it on a cached MCP failure) is deaf: say so in its topic and ask
-     * Main to restart it.
-     */
-    private suspend fun checkAlive(s: NamedSession) {
-        val deadline = System.currentTimeMillis() + startupGraceMs + 60_000
-        while (System.currentTimeMillis() < deadline) {
-            if (byName(s.name)?.createdAt != s.createdAt) return
-            // The side session checked in: pass it on to Main — its arrival is the proof of life.
-            if (aliveMarker(s.name).exists()) {
-                tellMain(s, "session_alive", "[side session \"${s.name}\" checked in: it is alive and connected.]")
-                return
-            }
-            delay(2000)
-        }
-        val current = byName(s.name)?.takeIf { it.createdAt == s.createdAt } ?: return
-        if (aliveMarker(s.name).exists()) return
-        val why = if (alive(current)) "its Telegram server never connected, so messages in its topic aren't reaching it"
-            else "its tmux session is gone"
-        log("side session \"${s.name}\" shows no sign of life: $why")
-        try {
-            Tg.bot.sendMessage(chatIdOf(s.chatId), "⚠️ Session \"${s.name}\" didn't come up: $why. Main is looking into it.",
-                threadId = threadOf(s.threadId))
-        } catch (e: Exception) { log("liveness warning failed: ${e.describe()}") }
-        tellMain(s, "session_dead", "[side session \"${s.name}\" never checked in: $why. Find out what happened: " +
-            "read its pane (tmux capture-pane -p -t ${s.tmux}) and the plugin log, fix the cause if you can, then call restart_session " +
-            "with name \"${s.name}\". Tell the user in Main what you found and whether it came back.]")
     }
 
     // ── Startup screen ───────────────────────────────────────────────────────

@@ -209,15 +209,13 @@ fun main() {
     mcp = McpServer(
         name = "telegram",
         version = "1.0.0",
-        instructions = INSTRUCTIONS,
+        instructions = INSTRUCTIONS + (Sessions.selfName?.let { Sessions.checkInInstructions(it) } ?: ""),
         tools = tools::list,
         callTool = tools::call,
         onNotification = { method, params ->
             if (method == "notifications/claude/channel/permission_request") inbound.onPermissionRequest(params)
         },
     )
-
-    if (!Sessions.isChild) Sessions.notifyMain = { method, params -> mcp.notify(method, params) }
 
     Runtime.getRuntime().addShutdownHook(Thread {
         // SIGTERM/SIGINT/SIGHUP: release the lock so the next session takes over at once.
@@ -275,8 +273,6 @@ fun main() {
             if (tmuxName == null || System.currentTimeMillis() >= deadline)
                 delay((deadline - System.currentTimeMillis()).coerceAtLeast(0))
             log("side session \"$side\" — ready, draining the spool")
-            // Tells the parent's liveness check this server came up and took the handshake.
-            Sessions.markAlive(side)
             var greeted = false
             Sessions.drain(side) { method, params ->
                 if (method == "notifications/claude/channel") {
