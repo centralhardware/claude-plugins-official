@@ -209,7 +209,7 @@ fun main() {
     mcp = McpServer(
         name = "telegram",
         version = "1.0.0",
-        instructions = INSTRUCTIONS + (Sessions.selfName?.let { Sessions.checkInInstructions(it) } ?: ""),
+        instructions = INSTRUCTIONS,
         tools = tools::list,
         callTool = tools::call,
         onNotification = { method, params ->
@@ -285,6 +285,8 @@ fun main() {
                         // Visible sign of life on the first delivery: 👀 on that message, or a line if it has none.
                         if (!greeted) {
                             greeted = true
+                            // The check-in Main's server waits for: written here, not left to the model.
+                            Sessions.markAlive(side)
                             Sessions.signalAlive(chatId, thread, meta?.get("message_id")?.jsonPrimitive?.content?.toLongOrNull())
                         }
                     }
