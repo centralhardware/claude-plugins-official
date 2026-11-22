@@ -314,23 +314,23 @@ object Sessions {
     suspend fun drop(scope: CoroutineScope, s: NamedSession): Boolean {
         val body = try { summaryFile(s.name).readText().trim().ifEmpty { null } } catch (_: Exception) { null }
             ?: "⚠️ no summary: the session closed without writing one"
-        end(s)
-        summaryFile(s.name).delete()
-        scope.launch {
-            val thread = threadOf(mainThread(s.chatId))
-            val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
-            try {
-                Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (closed)\n\n$body".take(4096),
-                    parseMode = HTMLParseMode, threadId = thread)
-            } catch (e: Exception) {
-                // Model-written HTML can be malformed: fall back to the raw text.
-                log("summary HTML rejected, sending plain: ${e.describe()}")
-                try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (closed)\n\n$body".take(4096), threadId = thread) }
-                catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
-            }
+        // Sequential, tmux killed last: a child closing itself runs inside that tmux.
+        val thread = threadOf(mainThread(s.chatId))
+        val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
+        try {
+            Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (closed)\n\n$body".take(4096),
+                parseMode = HTMLParseMode, threadId = thread)
+        } catch (e: Exception) {
+            // Model-written HTML can be malformed: fall back to the raw text.
+            log("summary HTML rejected, sending plain: ${e.describe()}")
+            try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (closed)\n\n$body".take(4096), threadId = thread) }
+            catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
         }
-        return try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
+        val deleted = try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
             catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
+        summaryFile(s.name).delete()
+        end(s)
+        return deleted
     }
 
     /** What a summary must look like — shown to the session in request_close's schema. */
