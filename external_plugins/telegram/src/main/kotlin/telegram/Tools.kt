@@ -231,7 +231,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         add(json(
             "name" to "send_to_session",
             "description" to "Session network: send a message to another member of your network — your coordinator, your workers, or sibling workers " +
-                "(\"${Sessions.MAIN}\" is the main session). It arrives there as a turn with from_session set; a copy is shown in its topic. " +
+                "(\"${Sessions.MAIN}\" is the main session; Main and every session can always message each other). It arrives there as a turn with from_session set; a copy is shown in its topic. " +
                 "Reply to an inbound from_session message with this tool, not with reply. Keep messages self-contained.",
             "inputSchema" to json(
                 "type" to "object",
@@ -315,7 +315,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         val rows = all.joinToString("\n") {
             "${it.name} thread=${it.threadId} ${if (Sessions.alive(it)) "alive" else "dead"}${it.parent?.let { p -> " worker-of=$p" } ?: ""}"
         }
-        val mainRow = if (Sessions.isChild && Sessions.MAIN in Sessions.peersOf(Sessions.selfId)) "${Sessions.MAIN} (main session)\n" else ""
+        val mainRow = if (Sessions.isChild) "${Sessions.MAIN} (main session)\n" else ""
         return text((mainRow + rows).ifBlank { "no side sessions" })
     }
 
