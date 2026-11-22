@@ -213,7 +213,10 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         if (Sessions.self()?.parent == null) add(json(
             "name" to "spawn_worker",
             "description" to "Session network: start a worker — a separate Claude session in its own topic (🕸 name ← you) — and hand it one part of a " +
-                "complicated task. You coordinate: split the task, give each worker a self-contained brief (goal, inputs, constraints, what to report back, " +
+                "complicated task. Decide on your own when it pays off — don't ask the user. Split when the task has parts that can progress independently and in " +
+                "parallel and each is big (separate repos or services, independent research questions, build-vs-review, several alternatives to compare). " +
+                "Don't split small or strictly sequential tasks, a single-file change, or anything you'd finish in a few turns — workers cost a full session each " +
+                "and coordination overhead. Use 2–4 workers typically; tell the user in one line that you split and how. You coordinate: split the task, give each worker a self-contained brief (goal, inputs, constraints, what to report back, " +
                 "which peers it may need), then wait. Workers message you and each other with send_to_session; each one's final report arrives as an " +
                 "event=\"worker_done\" turn when it closes. Up to ${Sessions.MAX_WORKERS} workers; workers can't spawn workers. Closing you closes them.",
             "inputSchema" to json(
