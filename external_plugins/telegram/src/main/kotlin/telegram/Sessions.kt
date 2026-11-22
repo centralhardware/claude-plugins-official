@@ -191,8 +191,8 @@ object Sessions {
     }
 
     /**
-     * Parent side: waits for the child's alive marker and tells the main session
-     * either way. A side session whose Telegram server never came up (e.g. Claude
+     * Parent side: waits for the child's alive marker; only its absence reaches the
+     * main session. A side session whose Telegram server never came up (e.g. Claude
      * Code skipped it on a cached MCP failure) is deaf: say so in its topic and ask
      * Main to restart it.
      */
@@ -200,10 +200,8 @@ object Sessions {
         val deadline = System.currentTimeMillis() + startupGraceMs + 60_000
         while (System.currentTimeMillis() < deadline) {
             if (byName(s.name)?.createdAt != s.createdAt) return
-            if (aliveMarker(s.name).exists()) {
-                tellMain(s, "session_alive", "[side session \"${s.name}\" is up: its Telegram server connected. No action needed.]")
-                return
-            }
+            // Alive: Main hears nothing — silence means healthy.
+            if (aliveMarker(s.name).exists()) return
             delay(2000)
         }
         val current = byName(s.name)?.takeIf { it.createdAt == s.createdAt } ?: return
@@ -212,11 +210,12 @@ object Sessions {
             else "its tmux session is gone"
         log("side session \"${s.name}\" shows no sign of life: $why")
         try {
-            Tg.bot.sendMessage(chatIdOf(s.chatId), "⚠️ Session \"${s.name}\" didn't come up: $why. Main has been asked to restart it.",
+            Tg.bot.sendMessage(chatIdOf(s.chatId), "⚠️ Session \"${s.name}\" didn't come up: $why. Main is looking into it.",
                 threadId = threadOf(s.threadId))
         } catch (e: Exception) { log("liveness warning failed: ${e.describe()}") }
-        tellMain(s, "session_dead", "[side session \"${s.name}\" did not come up: $why. Take action: call restart_session " +
-            "with name \"${s.name}\" once; if it fails again, tell the user in Main and point at tmux ${s.tmux}.]")
+        tellMain(s, "session_dead", "[side session \"${s.name}\" did not come up: $why. Find out what happened: " +
+            "read its pane (tmux capture-pane -p -t ${s.tmux}) and the plugin log, fix the cause if you can, then call restart_session " +
+            "with name \"${s.name}\". Tell the user in Main what you found and whether it came back.]")
     }
 
     // ── Startup screen ───────────────────────────────────────────────────────
