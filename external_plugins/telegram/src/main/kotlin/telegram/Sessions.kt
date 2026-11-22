@@ -1,6 +1,9 @@
 package telegram
 
 import dev.inmo.tgbotapi.extensions.api.chat.forum.createForumTopic
+import dev.inmo.tgbotapi.extensions.api.send.sendMessage
+import dev.inmo.tgbotapi.extensions.api.send.setMessageReaction
+import dev.inmo.tgbotapi.types.reactions.Reaction
 import kotlinx.coroutines.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
@@ -132,7 +135,45 @@ object Sessions {
         val cmd = "env $env $launchCmd; exec \$SHELL"
         check(tmux("new-session", "-d", "-s", s.tmux, "-c", home, cmd)) { "tmux new-session failed." }
         scope.launch { answerPrompts(s.tmux) }
+        scope.launch { checkAlive(s) }
         s
+    }
+
+    // ── Liveness ─────────────────────────────────────────────────────────────
+
+    private fun aliveMarker(name: String) = File(File(spoolRoot, name), ".alive")
+
+    /** Child side: its server is up and past the handshake. */
+    fun markAlive(name: String) = try { aliveMarker(name).apply { parentFile.mkdirs() }.writeText(System.currentTimeMillis().toString()) }
+        catch (e: Exception) { log("alive marker not written: ${e.describe()}") }
+
+    /** Child side: 👀 on the first delivered message, or a short line when there is none to react to. */
+    suspend fun signalAlive(chatId: String, threadId: Long?, messageId: Long?) {
+        try {
+            if (messageId != null) Tg.bot.setMessageReaction(chatIdOf(chatId), msgIdOf(messageId), Reaction.Emoji("👀"))
+            else Tg.bot.sendMessage(chatIdOf(chatId), "👀 Got it.", threadId = threadOf(threadId))
+        } catch (e: Exception) {
+            log("sign of life failed: ${e.describe()}")
+            try { Tg.bot.sendMessage(chatIdOf(chatId), "👀 Got it.", threadId = threadOf(threadId)) } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Parent side: a side session whose Telegram server never came up (e.g. Claude Code
+     * skipped it on a cached MCP failure) is deaf — say so in its topic instead of
+     * letting messages vanish.
+     */
+    private suspend fun checkAlive(s: NamedSession) {
+        delay(startupGraceMs + 60_000)
+        val current = byName(s.name)?.takeIf { it.createdAt == s.createdAt } ?: return
+        if (aliveMarker(s.name).exists()) return
+        val why = if (alive(current)) "its Telegram server never connected, so messages here aren't reaching it"
+            else "its tmux session is gone"
+        log("side session \"${s.name}\" shows no sign of life: $why")
+        try {
+            Tg.bot.sendMessage(chatIdOf(s.chatId), "⚠️ Session \"${s.name}\" didn't come up: $why. Check tmux ${s.tmux}, or /nsend here and start it again.",
+                threadId = threadOf(s.threadId))
+        } catch (e: Exception) { log("liveness warning failed: ${e.describe()}") }
     }
 
     // ── Startup screen ───────────────────────────────────────────────────────

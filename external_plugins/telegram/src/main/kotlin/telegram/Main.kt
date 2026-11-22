@@ -273,6 +273,9 @@ fun main() {
             if (tmuxName == null || System.currentTimeMillis() >= deadline)
                 delay((deadline - System.currentTimeMillis()).coerceAtLeast(0))
             log("side session \"$side\" — ready, draining the spool")
+            // Tells the parent's liveness check this server came up and took the handshake.
+            Sessions.markAlive(side)
+            var greeted = false
             Sessions.drain(side) { method, params ->
                 if (method == "notifications/claude/channel") {
                     val meta = params["meta"]?.jsonObject
@@ -281,6 +284,11 @@ fun main() {
                     if (chatId != null) {
                         thread?.let { lastThread[chatId] = it }
                         typing.start(chatId, thread)
+                        // Visible sign of life on the first delivery: 👀 on that message, or a line if it has none.
+                        if (!greeted) {
+                            greeted = true
+                            Sessions.signalAlive(chatId, thread, meta?.get("message_id")?.jsonPrimitive?.content?.toLongOrNull())
+                        }
                     }
                 }
                 mcp.notify(method, params)

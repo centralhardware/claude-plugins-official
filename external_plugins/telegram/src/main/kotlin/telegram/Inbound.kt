@@ -29,6 +29,7 @@ import dev.inmo.tgbotapi.types.reactions.Reaction
 import dev.inmo.tgbotapi.types.MessageThreadId
 import dev.inmo.tgbotapi.types.message.HTMLParseMode
 import dev.inmo.tgbotapi.extensions.api.chat.forum.deleteForumTopic
+import dev.inmo.tgbotapi.extensions.api.chat.forum.closeForumTopic
 import dev.inmo.tgbotapi.types.update.CallbackQueryUpdate
 import dev.inmo.tgbotapi.types.update.ChatMessageReactionUpdatedUpdate
 import dev.inmo.tgbotapi.types.update.EditMessageUpdate
@@ -50,6 +51,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 /** Permission-reply spec: "yes abcde" / "n abcde" — 5 letters a-z minus 'l'. */
 private val PERMISSION_REPLY_RE = Regex("""^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$""", RegexOption.IGNORE_CASE)
+const val CLOSE_PREFIX = "nsclose:"
+private val CLOSE_CALLBACK_RE = Regex("""^nsclose:(drop|close|keep):([a-z0-9][a-z0-9_-]{0,31})$""")
 private val PERM_CALLBACK_RE = Regex("""^perm:(allow|deny|more):([a-km-z]{5})$""")
 
 private val ISO_MS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
@@ -295,26 +298,7 @@ class Inbound(
             "nsdrop" -> {
                 val s = (if (arg.isNotEmpty()) Sessions.byName(arg.lowercase()) else side)
                     ?: return say("Not a session topic. Usage: /nsdrop <name>, or /nsdrop inside its topic.").let { true }
-                val transcript = Sessions.transcriptOf(s)
-                Sessions.end(s)
-                // The topic is about to vanish: leave a summary of the session in Main.
-                scope.launch {
-                    val body = if (transcript == null) "⚠️ no summary: transcript not found"
-                        else Sessions.summarize(transcript).fold({ it }, { "⚠️ no summary: " + (it.message ?: "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") })
-                    val thread = threadOf(Sessions.mainThread(s.chatId))
-                    val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
-                    try {
-                        Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (dropped)\n\n$body".take(4096),
-                            parseMode = HTMLParseMode, threadId = thread)
-                    } catch (e: Exception) {
-                        // Model-written HTML can be malformed: fall back to the raw text.
-                        log("summary HTML rejected, sending plain: ${e.describe()}")
-                        try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped)\n\n$body".take(4096), threadId = thread) }
-                        catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
-                    }
-                }
-                val deleted = try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
-                    catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
+                val deleted = dropSession(s)
                 // Inside the dropped topic there's nowhere left to answer.
                 if (threadId != s.threadId || !deleted) {
                     say(if (deleted) "🗑 Session \"${s.name}\" stopped and its topic deleted." else "🛑 Session \"${s.name}\" stopped, but the topic couldn't be deleted.")
@@ -390,9 +374,65 @@ class Inbound(
         }
     }
 
+    /** Stops [s], posts its summary in Main and deletes its topic. True if the topic was deleted. */
+    private suspend fun dropSession(s: NamedSession): Boolean {
+        val transcript = Sessions.transcriptOf(s)
+        Sessions.end(s)
+        // The topic is about to vanish: leave a summary of the session in Main.
+        scope.launch {
+            val body = if (transcript == null) "⚠️ no summary: transcript not found"
+                else Sessions.summarize(transcript).fold({ it }, { "⚠️ no summary: " + (it.message ?: "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") })
+            val thread = threadOf(Sessions.mainThread(s.chatId))
+            val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
+            try {
+                Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (dropped)\n\n$body".take(4096),
+                    parseMode = HTMLParseMode, threadId = thread)
+            } catch (e: Exception) {
+                // Model-written HTML can be malformed: fall back to the raw text.
+                log("summary HTML rejected, sending plain: ${e.describe()}")
+                try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped)\n\n$body".take(4096), threadId = thread) }
+                catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
+            }
+        }
+        return try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
+            catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
+    }
+
+    /** Stops [s] and closes (archives) its topic so the history stays readable. */
+    private suspend fun closeSession(s: NamedSession) {
+        Sessions.end(s)
+        try { Tg.bot.closeForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)) }
+        catch (e: Exception) { log("closeForumTopic failed: ${e.describe()}") }
+    }
+
+    /** Taps on a side session's request_close prompt: drop, close-and-keep, or stay open. */
+    private suspend fun onCloseButton(cq: DataCallbackQuery, answer: suspend (String?) -> Unit) {
+        val m = CLOSE_CALLBACK_RE.matchEntire(cq.data) ?: return answer(null)
+        if (cq.from.idStr !in AccessStore.load().allowFrom) return answer("Not authorized.")
+        val (action, name) = m.destructured
+        val message = (cq as? MessageCallbackQuery)?.message
+        val s = Sessions.byName(name)?.takeIf { message == null || (message as? PossiblyTopicMessage)?.threadId?.long == it.threadId }
+        // Single-use: drop the keyboard whatever happens next.
+        if (message != null) try { Tg.bot.editMessageReplyMarkup(message.chat.id, message.messageId, replyMarkup = null) } catch (_: Exception) {}
+        if (s == null) return answer("This session is already gone.")
+        when (action) {
+            "drop" -> { answer("🗑 Closing"); dropSession(s) }
+            "close" -> {
+                answer("🛑 Closed")
+                try { Tg.bot.sendMessage(chatIdOf(s.chatId), "🛑 Session \"${s.name}\" stopped. The topic is closed and stays for history.", threadId = threadOf(s.threadId)) } catch (_: Exception) {}
+                closeSession(s)
+            }
+            else -> {
+                answer("↩️ Kept open")
+                emitEvent(s.chatId, s.threadId, "Keep open", cq.from, mapOf("event" to "close_declined"))
+            }
+        }
+    }
+
     private suspend fun onCallback(cq: DataCallbackQuery) {
         suspend fun answer(text: String? = null) = try { Tg.bot.answerCallbackQuery(cq.id, text) } catch (_: Exception) {}
         if (cq.data.startsWith(ASK_PREFIX)) return onButton(cq, ::answer)
+        if (cq.data.startsWith(CLOSE_PREFIX)) return onCloseButton(cq, ::answer)
         val m = PERM_CALLBACK_RE.matchEntire(cq.data) ?: return answer()
         if (cq.from.idStr !in AccessStore.load().allowFrom) return answer("Not authorized.")
         val (behavior, requestId) = m.destructured

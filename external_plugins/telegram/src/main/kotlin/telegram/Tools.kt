@@ -188,6 +188,21 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                 "required" to listOf("id"),
             ),
         ))
+        // The side session's own exit: it proposes, the user confirms with a button.
+        if (Sessions.isChild) add(json(
+            "name" to "request_close",
+            "description" to "Ask the user to close this side session once its subject is resolved or completed. Posts the summary in this " +
+                "session's topic with buttons: close and delete the topic (a summary goes to Main), close and keep the topic as history, or keep " +
+                "working. Nothing closes without the user's tap. If they keep it open you get an event=\"close_declined\" message; " +
+                "otherwise this session is stopped — don't start new work after calling it.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json(
+                    "summary" to json("type" to "string", "description" to "One or two sentences: what was resolved or done. Plain text."),
+                ),
+                "required" to listOf("summary"),
+            ),
+        ))
         // Side sessions are spawned by the main session only; a child can't nest them.
         if (!Sessions.isChild) add(json(
             "name" to "spawn_session",
@@ -264,6 +279,21 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         return text("forwarded to session ${s.name}")
     }
 
+    private suspend fun requestClose(args: JsonObject): JsonObject {
+        val s = Sessions.self() ?: return text("request_close works only in a side session", error = true)
+        val summary = args.anyStr("summary")?.trim()?.ifEmpty { null } ?: throw IllegalArgumentException("summary required")
+        val markup = InlineKeyboardMarkup(listOf(
+            listOf(
+                CallbackDataInlineKeyboardButton("🗑 Close & delete topic", "${CLOSE_PREFIX}drop:${s.name}"),
+                CallbackDataInlineKeyboardButton("🛑 Close, keep topic", "${CLOSE_PREFIX}close:${s.name}"),
+            ),
+            listOf(CallbackDataInlineKeyboardButton("↩️ Keep working", "${CLOSE_PREFIX}keep:${s.name}")),
+        ))
+        Tg.bot.sendMessage(chatIdOf(s.chatId), "✅ Looks done: ${summary.take(3500)}\n\nClose session \"${s.name}\"?",
+            threadId = threadOf(s.threadId), replyMarkup = markup)
+        return text("asked the user to confirm closing; wait for their choice")
+    }
+
     private suspend fun spawnSession(args: JsonObject): JsonObject {
         val chatId = args.anyStr("chat_id") ?: throw IllegalArgumentException("chat_id required")
         val name = (args.anyStr("name") ?: throw IllegalArgumentException("name required")).lowercase()
@@ -313,6 +343,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "spawn_session" -> spawnSession(args)
             "list_sessions" -> listSessions()
             "forward_to_session" -> forwardToSession(args)
+            "request_close" -> requestClose(args)
             "schedule_message" -> scheduleMessage(args)
             "list_scheduled" -> listScheduled(args)
             "cancel_scheduled" -> cancelScheduled(args)
