@@ -23,7 +23,7 @@ import kotlin.time.Duration.Companion.seconds
  * an xterm.js page opened from the bot's menu button. There is no input path to
  * claude: after authentication the only message the socket accepts is
  * {"session": "<name>"} — which pane to watch: "" for the main session, or a
- * side session started with /ns (see Sessions). Each frame lists the side
+ * side session started by spawn_session (see Sessions). Each frame lists the side
  * sessions so the page can offer them.
  *
  * Auth: the page sends Telegram's signed `initData` as its first socket

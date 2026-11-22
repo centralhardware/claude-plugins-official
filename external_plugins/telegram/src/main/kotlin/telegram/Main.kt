@@ -209,7 +209,7 @@ fun main() {
     mcp = McpServer(
         name = "telegram",
         version = "1.0.0",
-        instructions = INSTRUCTIONS,
+        instructions = INSTRUCTIONS + (Sessions.selfName?.let { Sessions.checkInInstructions(it) } ?: ""),
         tools = tools::list,
         callTool = tools::call,
         onNotification = { method, params ->
@@ -252,7 +252,7 @@ fun main() {
         scope.launch { pollLoop(inbound, miniApp) }
         Scheduled.start(scope) { ownsPollerLock && !shuttingDown }
     } else {
-        // Side session (/ns): the main server polls and spools this topic's traffic here.
+        // Side session (spawn_session): the main server polls and spools this topic's traffic here.
         log("side session \"$side\" — not polling, reading the spool")
         Sessions.self()?.let { lastThread[it.chatId] = it.threadId }
         scope.launch {
@@ -273,6 +273,7 @@ fun main() {
             if (tmuxName == null || System.currentTimeMillis() >= deadline)
                 delay((deadline - System.currentTimeMillis()).coerceAtLeast(0))
             log("side session \"$side\" — ready, draining the spool")
+            var greeted = false
             Sessions.drain(side) { method, params ->
                 if (method == "notifications/claude/channel") {
                     val meta = params["meta"]?.jsonObject
@@ -281,6 +282,11 @@ fun main() {
                     if (chatId != null) {
                         thread?.let { lastThread[chatId] = it }
                         typing.start(chatId, thread)
+                        // Visible sign of life on the first delivery: 👀 on that message, or a line if it has none.
+                        if (!greeted) {
+                            greeted = true
+                            Sessions.signalAlive(chatId, thread, meta?.get("message_id")?.jsonPrimitive?.content?.toLongOrNull())
+                        }
                     }
                 }
                 mcp.notify(method, params)

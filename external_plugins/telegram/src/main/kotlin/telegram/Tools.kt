@@ -188,10 +188,24 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                 "required" to listOf("id"),
             ),
         ))
+        // The side session's own exit: it proposes, the user confirms with a button.
+        if (Sessions.isChild) add(json(
+            "name" to "request_close",
+            "description" to "Ask the user to close this side session once its subject is resolved or completed. Posts the summary in this " +
+                "session's topic with two buttons: close (stops the session, deletes the topic, posts a summary in Main) or keep working. Nothing closes without the user's tap. If they keep it open you get an event=\"close_declined\" message; " +
+                "otherwise this session is stopped — don't start new work after calling it.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json(
+                    "summary" to json("type" to "string", "description" to "One or two sentences: what was resolved or done. Plain text."),
+                ),
+                "required" to listOf("summary"),
+            ),
+        ))
         // Side sessions are spawned by the main session only; a child can't nest them.
         if (!Sessions.isChild) add(json(
             "name" to "spawn_session",
-            "description" to "Start a separate Claude session in a new forum topic — the same thing the user's /ns <name> command does — " +
+            "description" to "Start a separate Claude session in a new forum topic " +
                 "and hand it the message that started the subject. Use when a message in Main opens a new subject that will need a continuous " +
                 "back-and-forth: from then on every message in that topic goes to the new session, never to this one.",
             "inputSchema" to json(
@@ -205,6 +219,26 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                     "attachment_file_id" to json("type" to "string", "description" to "Optional: attachment_file_id from the inbound message, passed through."),
                 ),
                 "required" to listOf("chat_id", "name", "message"),
+            ),
+        ))
+        if (!Sessions.isChild) add(json(
+            "name" to "restart_session",
+            "description" to "Relaunch a side session in its existing topic when it didn't check in (no \"alive: <name>\" message after spawn_session). " +
+                "Kills its tmux, starts a fresh claude there, keeps the topic and any undelivered messages.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json("name" to json("type" to "string", "description" to "Side session name.")),
+                "required" to listOf("name"),
+            ),
+        ))
+        if (!Sessions.isChild) add(json(
+            "name" to "end_session",
+            "description" to "Close a side session: stops it, posts a summary of it in Main and deletes its topic. Only when the user asks " +
+                "for it in Main — a session that finished its subject asks the user itself (request_close).",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json("name" to json("type" to "string", "description" to "Side session name.")),
+                "required" to listOf("name"),
             ),
         ))
         if (!Sessions.isChild) add(json(
@@ -264,16 +298,51 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         return text("forwarded to session ${s.name}")
     }
 
+    /** What Main must do after starting a session: it has no clock, so it schedules its own check. */
+    private fun checkInNote(name: String) =
+        "It will SendMessage you \"alive: $name\" as its first action. Now schedule a one-shot check in 3 minutes (CronCreate): " +
+            "if no \"alive: $name\" has arrived by then, find out why (tmux capture-pane -p -t tg-$name, the plugin log), fix the cause " +
+            "if you can, call restart_session once, and tell the user in Main what you found. If it has arrived, do nothing."
+
+    private suspend fun endSession(args: JsonObject): JsonObject {
+        val name = args.anyStr("name")?.lowercase() ?: throw IllegalArgumentException("name required")
+        val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
+        val deleted = Sessions.drop(scope, s)
+        return text(if (deleted) "ended ${s.name}; topic deleted, summary on its way to Main" else "ended ${s.name}, but its topic couldn't be deleted")
+    }
+
+    private suspend fun restartSession(args: JsonObject): JsonObject {
+        val name = args.anyStr("name")?.lowercase() ?: throw IllegalArgumentException("name required")
+        val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
+        val fresh = Sessions.restart(scope, s).getOrElse { return text("restart_session failed: ${it.message}", error = true) }
+        try { Tg.bot.sendMessage(chatIdOf(s.chatId), "🔄 Session \"${s.name}\" restarted.", threadId = threadOf(s.threadId)) } catch (_: Exception) {}
+        return text("restarted ${fresh.name}. " + checkInNote(fresh.name))
+    }
+
+    private suspend fun requestClose(args: JsonObject): JsonObject {
+        val s = Sessions.self() ?: return text("request_close works only in a side session", error = true)
+        val summary = args.anyStr("summary")?.trim()?.ifEmpty { null } ?: throw IllegalArgumentException("summary required")
+        val markup = InlineKeyboardMarkup(listOf(
+            listOf(
+                CallbackDataInlineKeyboardButton("🗑 Close", "${CLOSE_PREFIX}drop:${s.name}"),
+                CallbackDataInlineKeyboardButton("↩️ Keep working", "${CLOSE_PREFIX}keep:${s.name}"),
+            ),
+        ))
+        Tg.bot.sendMessage(chatIdOf(s.chatId), "✅ Looks done: ${summary.take(3500)}\n\nClose session \"${s.name}\"?",
+            threadId = threadOf(s.threadId), replyMarkup = markup)
+        return text("asked the user to confirm closing; wait for their choice")
+    }
+
     private suspend fun spawnSession(args: JsonObject): JsonObject {
         val chatId = args.anyStr("chat_id") ?: throw IllegalArgumentException("chat_id required")
         val name = (args.anyStr("name") ?: throw IllegalArgumentException("name required")).lowercase()
         val message = args.anyStr("message") ?: throw IllegalArgumentException("message required")
         val s = Sessions.spawn(scope, name, chatId).getOrElse { return text("spawn_session failed: ${it.message}", error = true) }
-        Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" started for this subject. Messages in this topic go to it; /nsend here stops it.", threadId = threadOf(s.threadId))
+        Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" started for this subject. Messages in this topic go to it.", threadId = threadOf(s.threadId))
         forwardOriginal(chatId, s, args)
         // Spooled now; the child drains it once its own server is up (startup grace covers the prompts).
         handOff(s, chatId, message, args)
-        return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it")
+        return text("started session ${s.name} in topic thread ${s.threadId}; the opening message is queued for it. " + checkInNote(s.name))
     }
 
     private fun scheduleMessage(args: JsonObject): JsonObject {
@@ -313,6 +382,9 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "spawn_session" -> spawnSession(args)
             "list_sessions" -> listSessions()
             "forward_to_session" -> forwardToSession(args)
+            "request_close" -> requestClose(args)
+            "restart_session" -> restartSession(args)
+            "end_session" -> endSession(args)
             "schedule_message" -> scheduleMessage(args)
             "list_scheduled" -> listScheduled(args)
             "cancel_scheduled" -> cancelScheduled(args)

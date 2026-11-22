@@ -50,6 +50,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 /** Permission-reply spec: "yes abcde" / "n abcde" — 5 letters a-z minus 'l'. */
 private val PERMISSION_REPLY_RE = Regex("""^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$""", RegexOption.IGNORE_CASE)
+const val CLOSE_PREFIX = "nsclose:"
+private val CLOSE_CALLBACK_RE = Regex("""^nsclose:(drop|keep):([a-z0-9][a-z0-9_-]{0,31})$""")
 private val PERM_CALLBACK_RE = Regex("""^perm:(allow|deny|more):([a-km-z]{5})$""")
 
 private val ISO_MS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
@@ -239,7 +241,7 @@ class Inbound(
         val cmd = token.substringBefore('@').lowercase()
         val target = token.substringAfter('@', "")
         if (target.isNotEmpty() && !target.equals(Tg.username, ignoreCase = true)) return false
-        if (cmd !in setOf("start", "help", "status", "cancel", "ns", "nsend", "nsdrop", "sessions")) return false
+        if (cmd !in setOf("start", "help", "status", "cancel")) return false
         val gated = dmCommandGate(msg) ?: return true
         val chatId = msg.chatIdStr
         val threadId = msg.topicThreadId
@@ -259,10 +261,8 @@ class Inbound(
                     "Text and photos are forwarded; replies and reactions come back.\n\n" +
                     "/start — pairing instructions\n" +
                     "/status — check your pairing state\n" +
-                    "/ns <name> — start a separate Claude session in a new topic\n" +
-                    "/nsend — stop the session of this topic\n" +
-                    "/nsdrop — stop it and delete its topic\n" +
-                    "/sessions — list side sessions",
+                    "/cancel — interrupt the running turn (in a session topic: that session's)\n\n" +
+                    "Side sessions are started and closed by the main session.",
             )
             "status" -> {
                 val (access, senderId) = gated
@@ -273,57 +273,6 @@ class Inbound(
                     val code = access.pending.entries.firstOrNull { it.value.senderId == senderId }?.key
                     say(if (code != null) "Pending pairing — run in Claude Code:\n\n/telegram:access pair $code" else "Not paired. Send me a message to get a pairing code.")
                 }
-            }
-            "ns" -> {
-                if (arg.isEmpty()) return say("Usage: /ns <name> — starts a separate Claude session in a new topic.").let { true }
-                Sessions.spawn(scope, arg.lowercase(), chatId).fold(
-                    onSuccess = { s ->
-                        try {
-                            Tg.bot.sendMessage(chatIdOf(chatId), "🤖 Session \"${s.name}\" is starting (tmux ${s.tmux}). Messages in this topic go to it; /nsend here stops it.", threadId = threadOf(s.threadId))
-                        } catch (_: Exception) {}
-                        if (threadId != s.threadId) say("Started \"${s.name}\" in its own topic.")
-                    },
-                    onFailure = { say("⚠️ ${it.message ?: it.toString()}") },
-                )
-            }
-            "nsend" -> {
-                val s = (if (arg.isNotEmpty()) Sessions.byName(arg.lowercase()) else side)
-                    ?: return say("Not a session topic. Usage: /nsend <name>, or /nsend inside its topic.").let { true }
-                Sessions.end(s)
-                say("🛑 Session \"${s.name}\" stopped. The topic stays for history.")
-            }
-            "nsdrop" -> {
-                val s = (if (arg.isNotEmpty()) Sessions.byName(arg.lowercase()) else side)
-                    ?: return say("Not a session topic. Usage: /nsdrop <name>, or /nsdrop inside its topic.").let { true }
-                val transcript = Sessions.transcriptOf(s)
-                Sessions.end(s)
-                // The topic is about to vanish: leave a summary of the session in Main.
-                scope.launch {
-                    val body = if (transcript == null) "⚠️ no summary: transcript not found"
-                        else Sessions.summarize(transcript).fold({ it }, { "⚠️ no summary: " + (it.message ?: "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") })
-                    val thread = threadOf(Sessions.mainThread(s.chatId))
-                    val esc = { t: String -> t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") }
-                    try {
-                        Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 <b>Session \"${esc(s.name)}\"</b> (dropped)\n\n$body".take(4096),
-                            parseMode = HTMLParseMode, threadId = thread)
-                    } catch (e: Exception) {
-                        // Model-written HTML can be malformed: fall back to the raw text.
-                        log("summary HTML rejected, sending plain: ${e.describe()}")
-                        try { Tg.bot.sendMessage(chatIdOf(s.chatId), "📝 Session \"${s.name}\" (dropped)\n\n$body".take(4096), threadId = thread) }
-                        catch (e2: Exception) { log("summary post failed: ${e2.describe()}") }
-                    }
-                }
-                val deleted = try { Tg.bot.deleteForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)); true }
-                    catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
-                // Inside the dropped topic there's nowhere left to answer.
-                if (threadId != s.threadId || !deleted) {
-                    say(if (deleted) "🗑 Session \"${s.name}\" stopped and its topic deleted." else "🛑 Session \"${s.name}\" stopped, but the topic couldn't be deleted.")
-                }
-            }
-            "sessions" -> {
-                val list = Sessions.load()
-                say(if (list.isEmpty()) "No side sessions. Start one with /ns <name>."
-                    else list.joinToString("\n") { "${if (Sessions.alive(it)) "🟢" else "⚫"} ${it.name} (tmux ${it.tmux})" })
             }
             "cancel" -> if (side != null) {
                 typing.stop(chatId)
@@ -390,9 +339,29 @@ class Inbound(
         }
     }
 
+    /** Taps on a side session's request_close prompt: close (drop) or keep working. */
+    private suspend fun onCloseButton(cq: DataCallbackQuery, answer: suspend (String?) -> Unit) {
+        val m = CLOSE_CALLBACK_RE.matchEntire(cq.data) ?: return answer(null)
+        if (cq.from.idStr !in AccessStore.load().allowFrom) return answer("Not authorized.")
+        val (action, name) = m.destructured
+        val message = (cq as? MessageCallbackQuery)?.message
+        val s = Sessions.byName(name)?.takeIf { message == null || (message as? PossiblyTopicMessage)?.threadId?.long == it.threadId }
+        // Single-use: drop the keyboard whatever happens next.
+        if (message != null) try { Tg.bot.editMessageReplyMarkup(message.chat.id, message.messageId, replyMarkup = null) } catch (_: Exception) {}
+        if (s == null) return answer("This session is already gone.")
+        when (action) {
+            "drop" -> { answer("🗑 Closing"); Sessions.drop(scope, s) }
+            else -> {
+                answer("↩️ Kept open")
+                emitEvent(s.chatId, s.threadId, "Keep open", cq.from, mapOf("event" to "close_declined"))
+            }
+        }
+    }
+
     private suspend fun onCallback(cq: DataCallbackQuery) {
         suspend fun answer(text: String? = null) = try { Tg.bot.answerCallbackQuery(cq.id, text) } catch (_: Exception) {}
         if (cq.data.startsWith(ASK_PREFIX)) return onButton(cq, ::answer)
+        if (cq.data.startsWith(CLOSE_PREFIX)) return onCloseButton(cq, ::answer)
         val m = PERM_CALLBACK_RE.matchEntire(cq.data) ?: return answer()
         if (cq.from.idStr !in AccessStore.load().allowFrom) return answer("Not authorized.")
         val (behavior, requestId) = m.destructured
