@@ -192,8 +192,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         if (Sessions.isChild) add(json(
             "name" to "request_close",
             "description" to "Ask the user to close this side session once its subject is resolved or completed. Posts the summary in this " +
-                "session's topic with buttons: close and delete the topic (a summary goes to Main), close and keep the topic as history, or keep " +
-                "working. Nothing closes without the user's tap. If they keep it open you get an event=\"close_declined\" message; " +
+                "session's topic with two buttons: close (stops the session, deletes the topic, posts a summary in Main) or keep working. Nothing closes without the user's tap. If they keep it open you get an event=\"close_declined\" message; " +
                 "otherwise this session is stopped — don't start new work after calling it.",
             "inputSchema" to json(
                 "type" to "object",
@@ -220,6 +219,16 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
                     "attachment_file_id" to json("type" to "string", "description" to "Optional: attachment_file_id from the inbound message, passed through."),
                 ),
                 "required" to listOf("chat_id", "name", "message"),
+            ),
+        ))
+        if (!Sessions.isChild) add(json(
+            "name" to "restart_session",
+            "description" to "Relaunch a side session in its existing topic when it didn't come up (an event=\"session_dead\" message names it). " +
+                "Kills its tmux, starts a fresh claude there, keeps the topic and any undelivered messages.",
+            "inputSchema" to json(
+                "type" to "object",
+                "properties" to json("name" to json("type" to "string", "description" to "Side session name.")),
+                "required" to listOf("name"),
             ),
         ))
         if (!Sessions.isChild) add(json(
@@ -279,15 +288,22 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
         return text("forwarded to session ${s.name}")
     }
 
+    private suspend fun restartSession(args: JsonObject): JsonObject {
+        val name = args.anyStr("name")?.lowercase() ?: throw IllegalArgumentException("name required")
+        val s = Sessions.byName(name) ?: return text("no side session \"$name\"", error = true)
+        val fresh = Sessions.restart(scope, s).getOrElse { return text("restart_session failed: ${it.message}", error = true) }
+        try { Tg.bot.sendMessage(chatIdOf(s.chatId), "🔄 Session \"${s.name}\" restarted.", threadId = threadOf(s.threadId)) } catch (_: Exception) {}
+        return text("restarted ${fresh.name}; a session_alive or session_dead event follows")
+    }
+
     private suspend fun requestClose(args: JsonObject): JsonObject {
         val s = Sessions.self() ?: return text("request_close works only in a side session", error = true)
         val summary = args.anyStr("summary")?.trim()?.ifEmpty { null } ?: throw IllegalArgumentException("summary required")
         val markup = InlineKeyboardMarkup(listOf(
             listOf(
-                CallbackDataInlineKeyboardButton("🗑 Close & delete topic", "${CLOSE_PREFIX}drop:${s.name}"),
-                CallbackDataInlineKeyboardButton("🛑 Close, keep topic", "${CLOSE_PREFIX}close:${s.name}"),
+                CallbackDataInlineKeyboardButton("🗑 Close", "${CLOSE_PREFIX}drop:${s.name}"),
+                CallbackDataInlineKeyboardButton("↩️ Keep working", "${CLOSE_PREFIX}keep:${s.name}"),
             ),
-            listOf(CallbackDataInlineKeyboardButton("↩️ Keep working", "${CLOSE_PREFIX}keep:${s.name}")),
         ))
         Tg.bot.sendMessage(chatIdOf(s.chatId), "✅ Looks done: ${summary.take(3500)}\n\nClose session \"${s.name}\"?",
             threadId = threadOf(s.threadId), replyMarkup = markup)
@@ -344,6 +360,7 @@ class Tools(private val typing: Typing, private val scope: kotlinx.coroutines.Co
             "list_sessions" -> listSessions()
             "forward_to_session" -> forwardToSession(args)
             "request_close" -> requestClose(args)
+            "restart_session" -> restartSession(args)
             "schedule_message" -> scheduleMessage(args)
             "list_scheduled" -> listScheduled(args)
             "cancel_scheduled" -> cancelScheduled(args)

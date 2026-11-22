@@ -217,6 +217,8 @@ fun main() {
         },
     )
 
+    if (!Sessions.isChild) Sessions.notifyMain = { method, params -> mcp.notify(method, params) }
+
     Runtime.getRuntime().addShutdownHook(Thread {
         // SIGTERM/SIGINT/SIGHUP: release the lock so the next session takes over at once.
         try { if (Config.pidFile.readText().trim().toLong() == myPid) Config.pidFile.delete() } catch (_: Exception) {}

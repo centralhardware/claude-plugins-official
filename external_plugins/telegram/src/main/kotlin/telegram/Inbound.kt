@@ -29,7 +29,6 @@ import dev.inmo.tgbotapi.types.reactions.Reaction
 import dev.inmo.tgbotapi.types.MessageThreadId
 import dev.inmo.tgbotapi.types.message.HTMLParseMode
 import dev.inmo.tgbotapi.extensions.api.chat.forum.deleteForumTopic
-import dev.inmo.tgbotapi.extensions.api.chat.forum.closeForumTopic
 import dev.inmo.tgbotapi.types.update.CallbackQueryUpdate
 import dev.inmo.tgbotapi.types.update.ChatMessageReactionUpdatedUpdate
 import dev.inmo.tgbotapi.types.update.EditMessageUpdate
@@ -52,7 +51,7 @@ import java.util.concurrent.ConcurrentHashMap
 /** Permission-reply spec: "yes abcde" / "n abcde" — 5 letters a-z minus 'l'. */
 private val PERMISSION_REPLY_RE = Regex("""^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$""", RegexOption.IGNORE_CASE)
 const val CLOSE_PREFIX = "nsclose:"
-private val CLOSE_CALLBACK_RE = Regex("""^nsclose:(drop|close|keep):([a-z0-9][a-z0-9_-]{0,31})$""")
+private val CLOSE_CALLBACK_RE = Regex("""^nsclose:(drop|keep):([a-z0-9][a-z0-9_-]{0,31})$""")
 private val PERM_CALLBACK_RE = Regex("""^perm:(allow|deny|more):([a-km-z]{5})$""")
 
 private val ISO_MS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC)
@@ -398,14 +397,7 @@ class Inbound(
             catch (e: Exception) { log("deleteForumTopic failed: ${e.describe()}"); false }
     }
 
-    /** Stops [s] and closes (archives) its topic so the history stays readable. */
-    private suspend fun closeSession(s: NamedSession) {
-        Sessions.end(s)
-        try { Tg.bot.closeForumTopic(chatIdOf(s.chatId), MessageThreadId(s.threadId)) }
-        catch (e: Exception) { log("closeForumTopic failed: ${e.describe()}") }
-    }
-
-    /** Taps on a side session's request_close prompt: drop, close-and-keep, or stay open. */
+    /** Taps on a side session's request_close prompt: close (drop) or keep working. */
     private suspend fun onCloseButton(cq: DataCallbackQuery, answer: suspend (String?) -> Unit) {
         val m = CLOSE_CALLBACK_RE.matchEntire(cq.data) ?: return answer(null)
         if (cq.from.idStr !in AccessStore.load().allowFrom) return answer("Not authorized.")
@@ -417,11 +409,6 @@ class Inbound(
         if (s == null) return answer("This session is already gone.")
         when (action) {
             "drop" -> { answer("🗑 Closing"); dropSession(s) }
-            "close" -> {
-                answer("🛑 Closed")
-                try { Tg.bot.sendMessage(chatIdOf(s.chatId), "🛑 Session \"${s.name}\" stopped. The topic is closed and stays for history.", threadId = threadOf(s.threadId)) } catch (_: Exception) {}
-                closeSession(s)
-            }
             else -> {
                 answer("↩️ Kept open")
                 emitEvent(s.chatId, s.threadId, "Keep open", cq.from, mapOf("event" to "close_declined"))

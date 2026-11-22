@@ -120,7 +120,26 @@ object Sessions {
         val topic = Tg.bot.createForumTopic(chatIdOf(chatId), "🤖 $name", dev.inmo.tgbotapi.types.ForumTopic.CYAN)
         val s = NamedSession(name, chatId, topic.messageThreadId.long, "tg-$name", System.currentTimeMillis())
         save(load().filter { it.name != name } + s)
-        File(spoolRoot, name).deleteRecursively()
+        launch(scope, s)
+        s
+    }
+
+    /**
+     * Relaunches claude for an existing binding in the same topic — for a session
+     * whose Telegram server never came up. Undelivered spooled messages are kept.
+     */
+    fun restart(scope: CoroutineScope, s: NamedSession): Result<NamedSession> = runCatching {
+        tmux("kill-session", "-t", "=${s.tmux}")
+        aliveMarker(s.name).delete()
+        val fresh = s.copy(createdAt = System.currentTimeMillis())
+        save(load().filter { it.name != s.name } + fresh)
+        launch(scope, fresh, clearSpool = false)
+        fresh
+    }
+
+    private fun launch(scope: CoroutineScope, s: NamedSession, clearSpool: Boolean = true) {
+        val name = s.name
+        if (clearSpool) File(spoolRoot, name).deleteRecursively()
 
         // tmux's -e isn't in every version; pass the env through the shell instead.
         val env = buildList {
@@ -136,7 +155,6 @@ object Sessions {
         check(tmux("new-session", "-d", "-s", s.tmux, "-c", home, cmd)) { "tmux new-session failed." }
         scope.launch { answerPrompts(s.tmux) }
         scope.launch { checkAlive(s) }
-        s
     }
 
     // ── Liveness ─────────────────────────────────────────────────────────────
@@ -158,22 +176,47 @@ object Sessions {
         }
     }
 
+    /** Parent side: hands a notification to the main session (set once its MCP server exists). */
+    @Volatile var notifyMain: ((String, JsonObject) -> Unit)? = null
+
+    private fun tellMain(s: NamedSession, event: String, content: String) {
+        val meta = buildJsonObject {
+            put("chat_id", s.chatId)
+            mainThread(s.chatId)?.let { put("thread_id", it.toString()) }
+            put("user", "system"); put("event", event); put("session", s.name)
+            put("ts", java.time.Instant.now().toString())
+        }
+        try { notifyMain?.invoke("notifications/claude/channel", buildJsonObject { put("content", content); put("meta", meta) }) }
+        catch (e: Exception) { log("main not told about ${s.name}: ${e.describe()}") }
+    }
+
     /**
-     * Parent side: a side session whose Telegram server never came up (e.g. Claude Code
-     * skipped it on a cached MCP failure) is deaf — say so in its topic instead of
-     * letting messages vanish.
+     * Parent side: waits for the child's alive marker and tells the main session
+     * either way. A side session whose Telegram server never came up (e.g. Claude
+     * Code skipped it on a cached MCP failure) is deaf: say so in its topic and ask
+     * Main to restart it.
      */
     private suspend fun checkAlive(s: NamedSession) {
-        delay(startupGraceMs + 60_000)
+        val deadline = System.currentTimeMillis() + startupGraceMs + 60_000
+        while (System.currentTimeMillis() < deadline) {
+            if (byName(s.name)?.createdAt != s.createdAt) return
+            if (aliveMarker(s.name).exists()) {
+                tellMain(s, "session_alive", "[side session \"${s.name}\" is up: its Telegram server connected. No action needed.]")
+                return
+            }
+            delay(2000)
+        }
         val current = byName(s.name)?.takeIf { it.createdAt == s.createdAt } ?: return
         if (aliveMarker(s.name).exists()) return
-        val why = if (alive(current)) "its Telegram server never connected, so messages here aren't reaching it"
+        val why = if (alive(current)) "its Telegram server never connected, so messages in its topic aren't reaching it"
             else "its tmux session is gone"
         log("side session \"${s.name}\" shows no sign of life: $why")
         try {
-            Tg.bot.sendMessage(chatIdOf(s.chatId), "⚠️ Session \"${s.name}\" didn't come up: $why. Check tmux ${s.tmux}, or /nsend here and start it again.",
+            Tg.bot.sendMessage(chatIdOf(s.chatId), "⚠️ Session \"${s.name}\" didn't come up: $why. Main has been asked to restart it.",
                 threadId = threadOf(s.threadId))
         } catch (e: Exception) { log("liveness warning failed: ${e.describe()}") }
+        tellMain(s, "session_dead", "[side session \"${s.name}\" did not come up: $why. Take action: call restart_session " +
+            "with name \"${s.name}\" once; if it fails again, tell the user in Main and point at tmux ${s.tmux}.]")
     }
 
     // ── Startup screen ───────────────────────────────────────────────────────
