@@ -9,6 +9,7 @@ import dev.inmo.tgbotapi.types.BotCommand
 import dev.inmo.tgbotapi.types.commands.BotCommandScopeAllPrivateChats
 import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
+import dev.inmo.tgbotapi.types.update.abstracts.UpdateDeserializationStrategy
 import java.io.File
 import kotlin.system.exitProcess
 
@@ -123,16 +124,11 @@ private val ALLOWED_UPDATES = listOf("message", "edited_message", "callback_quer
  * Webhook mode: tg-webhook-relay receives Telegram's webhook and forwards each
  * update to the mini app server's /telegram/update. The lock holder still owns
  * the bot (server, commands, scheduled sends); it just doesn't call getUpdates.
- * The shared secret is derived from the token on both sides.
  */
 object Webhook {
     val enabled get() = Config.env("TELEGRAM_UPDATES") == "webhook"
-    val secret: String by lazy {
-        java.security.MessageDigest.getInstance("SHA-256").digest("tg-webhook-relay:${Config.token}".toByteArray())
-            .joinToString("") { "%02x".format(it) }
-    }
-    private val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true; isLenient = true; explicitNulls = false }
-    fun parse(body: String) = json.decodeFromString(dev.inmo.tgbotapi.types.update.abstracts.UpdateDeserializationStrategy, body)
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true; explicitNulls = false }
+    fun parse(body: String) = json.decodeFromString(UpdateDeserializationStrategy, body)
 }
 
 private suspend fun pollLoop(inbound: Inbound, miniApp: MiniApp) {

@@ -38,8 +38,8 @@ import kotlin.time.Duration.Companion.seconds
  * TELEGRAM_MINIAPP_HISTORY (scrollback lines, default 3000).
  *
  * In webhook mode (TELEGRAM_UPDATES=webhook) the same server also takes
- * POST /telegram/update from tg-webhook-relay: a plain Telegram webhook call,
- * authenticated by X-Telegram-Bot-Api-Secret-Token.
+ * POST /telegram/update from tg-webhook-relay: the raw update as the body. The relay
+ * is on the private network, so there is no secret.
  */
 class MiniApp(token: String) {
     private val keeper = TelegramAPIUrlsKeeper(token)
@@ -61,9 +61,6 @@ class MiniApp(token: String) {
                     get("/app.css") { asset(call, "app.css", ContentType.Text.CSS) }
                     webSocket("/ws") { stream(this) }
                     if (onUpdate != null) post("/telegram/update") {
-                        if (call.request.header("X-Telegram-Bot-Api-Secret-Token") != Webhook.secret) {
-                            call.respond(HttpStatusCode.Unauthorized); return@post
-                        }
                         // A non-2xx makes the relay retry the same update, in order.
                         try { onUpdate(call.receiveText()); call.respond(HttpStatusCode.OK) }
                         catch (e: Exception) { log("webhook update rejected: ${e.describe()}"); call.respond(HttpStatusCode.BadRequest) }
